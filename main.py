@@ -1,9 +1,5 @@
-# main.py — sales-reports-bot
-import asyncio
-import html
-import json
-import logging
-import os
+# main.py — Fiber Reports (summary-only, safer sending & direct reply)
+import asyncio, html, json, logging, os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -26,7 +22,7 @@ REPORT_TZ_NAME = os.environ.get("REPORT_TZ", "Europe/Kyiv")
 REPORT_TZ = ZoneInfo(REPORT_TZ_NAME)
 REPORT_TIME = os.environ.get("REPORT_TIME", "19:00")  # HH:MM
 
-REPORT_CHAT = int(os.environ.get("REPORT_CHAT", "0"))  # чат для сумарного звіту
+REPORT_SUMMARY_CHAT = int(os.environ.get("REPORT_SUMMARY_CHAT", "0"))  # опційно
 
 # ------------------------ Logging -------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -55,8 +51,8 @@ async def b24(method: str, **params) -> Any:
                 data = await resp.json()
                 if "error" in data:
                     err = data["error"]; desc = data.get("error_description")
-                    if err in ("QUERY_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS"):
-                        log.warning("Bitrix rate-limit: %s (%s), retry #%s", err, desc, attempt+1)
+                    if err in ("QUERY_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS", "INTERNAL_SERVER_ERROR"):
+                        log.warning("Bitrix temp error: %s (%s), retry #%s", err, desc, attempt+1)
                         await _sleep_backoff(attempt); continue
                     raise RuntimeError(f"B24 error: {err}: {desc}")
                 return data.get("result")
@@ -80,7 +76,7 @@ async def b24_list(method: str, *, page_size: int = 200, throttle: float = 0.15,
         if throttle: await asyncio.sleep(throttle)
     return out
 
-# ------------------------ Caches --------------------------
+# ------------------------ Caches / mappings ---------------
 _DEAL_TYPE_MAP: Optional[Dict[str, str]] = None
 async def get_deal_type_map() -> Dict[str, str]:
     global _DEAL_TYPE_MAP
@@ -89,6 +85,14 @@ async def get_deal_type_map() -> Dict[str, str]:
         _DEAL_TYPE_MAP = {i["STATUS_ID"]: i["NAME"] for i in items}
         log.info("[cache] DEAL_TYPE: %s", len(_DEAL_TYPE_MAP))
     return _DEAL_TYPE_MAP
+
+def _is_connection(type_id: str, type_name: Optional[str] = None) -> bool:
+    name = (type_name or "").strip().lower()
+    if not name and _DEAL_TYPE_MAP:
+        name = (_DEAL_TYPE_MAP.get(type_id, "") or "").strip().lower()
+    return name in ("підключення", "подключение") or ("підключ" in name) or ("подключ" in name)
+
+_BRIGADE_STAGE = {1: "UC_XF8O6V", 2: "UC_0XLPCN", 3: "UC_204CP3", 4: "UC_TNEW3Z", 5: "UC_RMBZ37"}
 
 # ------------------------ Time helpers -------------------
 def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str]:
@@ -100,97 +104,174 @@ def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str]:
     label = start_local.strftime("%d.%m.%Y")
     return label, start_utc.isoformat(), end_utc.isoformat()
 
-# ------------------------ Summary report ------------------
+# ------------------------ CAT0 stage resolving ------------
+_CAT0_STAGES: Optional[Dict[str, str]] = None
+async def _cat0_stages() -> Dict[str, str]:
+    global _CAT0_STAGES
+    if _CAT0_STAGES is None:
+        items = await b24("crm.status.list", filter={"ENTITY_ID": "DEAL_STAGE_0"})
+        _CAT0_STAGES = {i["STATUS_ID"]: i["NAME"] for i in items}
+        log.info("[cache] CAT0 stages: %s", len(_CAT0_STAGES))
+    return _CAT0_STAGES
+
+async def _resolve_cat0_stage_ids() -> Tuple[str, str]:
+    st = await _cat0_stages()
+    exact_id = None; think_id = None
+    for sid, nm in st.items():
+        n = (nm or "").strip().lower()
+        if n == "на конкретний день": exact_id = sid
+        if n == "думають": think_id = sid
+    if not exact_id: exact_id = "5"         # fallback з твого дампу
+    if not think_id: think_id = "DETAILS"   # fallback з твого дампу
+    return f"C0:{exact_id}", f"C0:{think_id}"
+
+async def _count_open_in_stage(cat_id: int, stage_full: str) -> int:
+    deals = await b24_list(
+        "crm.deal.list",
+        order={"ID": "DESC"},
+        filter={"CLOSED": "N", "CATEGORY_ID": cat_id, "STAGE_ID": stage_full},
+        select=["ID"],
+    )
+    if deals: return len(deals)
+    # fallback: короткий STAGE_ID
+    short = stage_full.split(":", 1)[-1]
+    deals_fb = await b24_list(
+        "crm.deal.list",
+        order={"ID": "DESC"},
+        filter={"CLOSED": "N", "CATEGORY_ID": cat_id, "STAGE_ID": short},
+        select=["ID"],
+    )
+    return len(deals_fb)
+
+# ------------------------ Summary builder -----------------
 async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     label, frm, to = _day_bounds(offset_days)
-    deal_type_map = await get_deal_type_map()
+    type_map = await get_deal_type_map()
 
-    # Подані в кат.20
-    created_conn = await b24_list("crm.deal.list",
+    # created today (cat20)
+    created_conn = 0
+    created = await b24_list(
+        "crm.deal.list",
+        order={"ID": "DESC"},
         filter={">=DATE_CREATE": frm, "<DATE_CREATE": to, "CATEGORY_ID": 20},
-        select=["ID", "TYPE_ID", "STAGE_ID", "CLOSED"])
-    connections_created = sum(1 for d in created_conn if deal_type_map.get(d.get("TYPE_ID"), "").lower().startswith("підключ"))
+        select=["ID", "TYPE_ID"],
+    )
+    for d in created:
+        tid = d.get("TYPE_ID") or ""
+        if _is_connection(tid, type_map.get(tid)):
+            created_conn += 1
 
-    # Закриті в кат.20
-    closed_conn = await b24_list("crm.deal.list",
-        filter={">=DATE_MODIFY": frm, "<DATE_MODIFY": to, "CATEGORY_ID": 20, "STAGE_ID": "C20:WON"},
-        select=["ID", "TYPE_ID"])
-    connections_closed = sum(1 for d in closed_conn if deal_type_map.get(d.get("TYPE_ID"), "").lower().startswith("підключ"))
+    # closed today (cat20 WON)
+    closed_conn = 0
+    closed = await b24_list(
+        "crm.deal.list",
+        order={"DATE_MODIFY": "ASC"},
+        filter={"STAGE_ID": "C20:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to},
+        select=["ID", "TYPE_ID"],
+    )
+    for d in closed:
+        tid = d.get("TYPE_ID") or ""
+        if _is_connection(tid, type_map.get(tid)):
+            closed_conn += 1
 
-    # Активні на бригадах (кат.20)
-    active_conn = await b24_list("crm.deal.list",
-        filter={"CATEGORY_ID": 20, "CLOSED": "N"},
-        select=["ID", "TYPE_ID", "STAGE_ID"])
-    connections_active = sum(1 for d in active_conn if deal_type_map.get(d.get("TYPE_ID"), "").lower().startswith("підключ"))
+    # active on brigades (open in brigade stages)
+    brigade_stage_ids = {f"C20:{v}" for v in _BRIGADE_STAGE.values()}
+    active_conn = 0
+    open_cat20 = await b24_list(
+        "crm.deal.list",
+        order={"ID": "DESC"},
+        filter={"CLOSED": "N", "CATEGORY_ID": 20},
+        select=["ID", "TYPE_ID", "STAGE_ID"],
+    )
+    for d in open_cat20:
+        if str(d.get("STAGE_ID") or "") in brigade_stage_ids:
+            tid = d.get("TYPE_ID") or ""
+            if _is_connection(tid, type_map.get(tid)):
+                active_conn += 1
 
-    # Категорія 0
-    deals_cat0 = await b24_list("crm.deal.list",
-        filter={"CATEGORY_ID": 0, "CLOSED": "N"},
-        select=["ID", "STAGE_ID"])
-    conn_day = sum(1 for d in deals_cat0 if d.get("STAGE_ID") == "5")       # На конкретний день
-    conn_think = sum(1 for d in deals_cat0 if d.get("STAGE_ID") == "DETAILS")  # Думають
+    # category 0: exact day & think
+    c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
+    exact_cnt = await _count_open_in_stage(0, c0_exact_stage)
+    think_cnt = await _count_open_in_stage(0, c0_think_stage)
+
+    log.info("[summary] created=%s, closed=%s, active=%s, exact=%s, think=%s",
+             created_conn, closed_conn, active_conn, exact_cnt, think_cnt)
 
     return {
         "date_label": label,
-        "connections": {
-            "created": connections_created,
-            "closed": connections_closed,
-            "active": connections_active,
-            "on_day": conn_day,
-            "thinking": conn_think,
-        },
+        "connections": {"created": created_conn, "closed": closed_conn, "active": active_conn},
+        "cat0": {"exact_day": exact_cnt, "think": think_cnt},
     }
 
 def format_company_summary(d: Dict[str, Any]) -> str:
     dl = d["date_label"]
-    c = d["connections"]
-
-    lines = [
-        f"📅 Дата: {dl}",
+    c = d["connections"]; c0 = d["cat0"]
+    return "\n".join([
+        f"🗓 <b>Дата: {dl}</b>",
         "",
         "━━━━━━━━━━━━━━━",
-        "📌 Підключення",
+        "📌 <b>Підключення</b>",
         f"🆕 Подали: <b>{c['created']}</b>",
         f"✅ Закрили: <b>{c['closed']}</b>",
         f"📊 Активні на бригадах: <b>{c['active']}</b>",
         "",
-        f"📅 На конкретний день: <b>{c['on_day']}</b>",
-        f"💭 Думають: <b>{c['thinking']}</b>",
+        f"📅 На конкретний день: <b>{c0['exact_day']}</b>",
+        f"💭 Думають: <b>{c0['think']}</b>",
         "━━━━━━━━━━━━━━━",
-    ]
-    return "\n".join(lines)
+    ])
 
 # ------------------------ Send helpers -------------------
 async def _safe_send(chat_id: int, text: str):
-    for attempt in range(5):
+    for attempt in range(7):
         try:
             await bot.send_message(chat_id, text, disable_web_page_preview=True)
             return
         except Exception as e:
-            log.warning("telegram send failed: %s, retry #%s", e, attempt+1)
-            await _sleep_backoff(attempt)
-    log.error("telegram send failed permanently")
+            msg = str(e)
+            # спробуємо витягнути retry_after з тексту помилки Телеги
+            retry_after = None
+            if "retry after " in msg.lower():
+                try:
+                    retry_after = int(msg.lower().split("retry after ")[1].split()[0])
+                except Exception:
+                    retry_after = None
+            wait = retry_after if retry_after else min(30, 2 ** attempt)
+            log.warning("telegram send failed: %s, waiting %ss (try #%s)", e, wait, attempt+1)
+            await asyncio.sleep(wait)
+    log.error("telegram send failed permanently (chat %s)", chat_id)
 
-async def send_company_summary(offset_days: int = 0) -> None:
-    if not REPORT_CHAT:
-        log.warning("No REPORT_CHAT configured")
-        return
+async def send_company_summary_to_chat(target_chat: int, offset_days: int = 0) -> None:
     try:
         data = await build_company_summary(offset_days)
-        await _safe_send(REPORT_CHAT, format_company_summary(data))
-    except Exception:
-        log.exception("company summary failed")
-        await _safe_send(REPORT_CHAT, "❗️Помилка формування комбінованого звіту")
+        await _safe_send(target_chat, format_company_summary(data))
+    except Exception as e:
+        log.exception("company summary failed for chat %s", target_chat)
+        await _safe_send(target_chat, f"❗️Помилка формування сумарного звіту:\n<code>{html.escape(str(e))}</code>")
+
+async def send_company_summary(offset_days: int = 0) -> None:
+    if REPORT_SUMMARY_CHAT:
+        await send_company_summary_to_chat(REPORT_SUMMARY_CHAT, offset_days)
+    else:
+        log.warning("REPORT_SUMMARY_CHAT is not configured")
 
 # ------------------------ Manual command -----------------
 @dp.message(Command("report_now"))
 async def report_now(m: Message):
-    offset = 0
+    """
+    /report_now           — сумарний за сьогодні в цей же чат
+    /report_now 1         — сумарний за вчора в цей же чат
+    """
     parts = (m.text or "").split()
-    if len(parts) >= 2 and parts[1].isdigit():
+    offset = 0
+    if len(parts) >= 2 and parts[1].lstrip("-").isdigit():
         offset = int(parts[1])
+
     await m.answer("🔄 Формую сумарний звіт…")
-    await send_company_summary(offset)
+    # 1) завжди відповідаємо в той чат, де команда
+    await send_company_summary_to_chat(m.chat.id, offset)
+    # 2) додатково — у службовий чат, якщо налаштований і він інший
+    if REPORT_SUMMARY_CHAT and REPORT_SUMMARY_CHAT != m.chat.id:
+        await send_company_summary_to_chat(REPORT_SUMMARY_CHAT, offset)
     await m.answer("✅ Готово")
 
 # ------------------------ Scheduler ----------------------
@@ -210,7 +291,7 @@ async def scheduler_loop():
             sleep_sec = max(1, (nxt - now_utc).total_seconds())
             log.info("[scheduler] next run at %s in %ss", nxt.isoformat(), int(sleep_sec))
             await asyncio.sleep(sleep_sec)
-            log.info("[scheduler] tick -> sending company summary")
+            log.info("[scheduler] tick -> sending summary")
             await send_company_summary(0)
         except Exception:
             log.exception("[scheduler] loop error")
@@ -222,7 +303,7 @@ async def on_startup():
     global HTTP
     HTTP = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
     await bot.set_my_commands([
-        BotCommand(command="report_now", description="Ручний запуск звіту (/report_now [offset])"),
+        BotCommand(command="report_now", description="Сумарний звіт (/report_now [offset])"),
     ])
     url = f"{WEBHOOK_BASE}/webhook/{WEBHOOK_SECRET}"
     await bot.set_webhook(url)
