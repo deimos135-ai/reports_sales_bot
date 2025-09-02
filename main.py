@@ -1,4 +1,4 @@
-# main.py — reports-bot (з комбінованим “дівчат” звітом)
+# main.py — reports-bot (кат.0 для Підключень + кат.20 для Сервісу)
 import asyncio
 import html
 import json
@@ -48,7 +48,7 @@ async def healthz():
     return {"status": "ok"}
 
 # ------------------------ Bitrix helpers ------------------
-async def _sleep_backoff(attempt: int, base: float = 0.5, cap: float = 8.0):
+async def _sleep_backoff(attempt: int, base: float = 0.6, cap: float = 10.0):
     await asyncio.sleep(min(cap, base * (2 ** attempt)))
 
 async def b24(method: str, **params) -> Any:
@@ -94,6 +94,53 @@ async def get_deal_type_map() -> Dict[str, str]:
         log.info("[cache] DEAL_TYPE: %s", len(_DEAL_TYPE_MAP))
     return _DEAL_TYPE_MAP
 
+# стадії по категоріях (кеш)
+_CAT_STAGES: Dict[int, List[Dict[str, Any]]] = {}
+
+async def get_category_stages(category_id: int) -> List[Dict[str, Any]]:
+    """
+    Повертає список стадій для воронки категорії (через офіційний метод або fallback).
+    Елемент має як мінімум STATUS_ID та NAME.
+    """
+    if category_id in _CAT_STAGES:
+        return _CAT_STAGES[category_id]
+    items = []
+    try:
+        items = await b24("crm.dealcategory.stage.list", filter={"CATEGORY_ID": category_id})
+    except Exception:
+        # ім'я ENTITY_ID для дефолтної/категорних стадій: DEAL_STAGE або DEAL_STAGE_{cat}
+        entity = "DEAL_STAGE" if category_id == 0 else f"DEAL_STAGE_{category_id}"
+        items = await b24("crm.status.list", filter={"ENTITY_ID": entity})
+    _CAT_STAGES[category_id] = items or []
+    log.info("[cache] CAT%s stages: %s", category_id, len(_CAT_STAGES[category_id]))
+    return _CAT_STAGES[category_id]
+
+def _match_stage_id_by_name(stages: List[Dict[str, Any]], *needles: str) -> List[str]:
+    res = []
+    nl = [n.lower() for n in needles]
+    for s in stages:
+        name = (s.get("NAME") or "").lower()
+        if any(n in name for n in nl):
+            res.append(s.get("STATUS_ID"))
+    return res
+
+def _won_stage_ids(stages: List[Dict[str, Any]]) -> List[str]:
+    """
+    Витягаємо WON/успішно за назвою/семантикою.
+    """
+    ids = set()
+    for s in stages:
+        name = (s.get("NAME") or "").lower()
+        sem = (s.get("SEMANTICS") or "").upper()
+        if sem == "S" or "won" in name or "успеш" in name or "успіш" in name:
+            sid = s.get("STATUS_ID")
+            if sid: ids.add(sid)
+    # запасний варіант звичних кодів:
+    for guess in ("WON", "C0:WON", "C20:WON"):
+        if any(guess == st.get("STATUS_ID") for st in stages):
+            ids.add(guess)
+    return list(ids)
+
 # класифікація назв типів у наші кошики
 def normalize_type(type_name: str) -> str:
     t = (type_name or "").strip().lower()
@@ -119,12 +166,11 @@ def normalize_type(type_name: str) -> str:
     if any(k in t for k in ("кц", "контакт-центр", "колл-центр", "call")): return "cc_request"
     return "other"
 
-# “кошики” для рядків звіту
+# “кошики” для виводу
 BUCKETS = [
     ("connection", "📡 Підключення"),
     ("service", "🛠️ Сервіс"),
     ("reconnection", "🔄 Перепідключення"),
-    # нижче — додаткові, використовуються у розширених метриках
     ("accident", "⚠️ Аварії"),
     ("cc_request", "📞 Пропущені / КЦ"),
 ]
@@ -155,7 +201,7 @@ async def _bucket_codes() -> Dict[str, List[str]]:
         out.setdefault(cls, []).append(code)
     return out
 
-# ------------------------ Brigade daily report (already had) ---------------
+# ------------------------ Brigade daily report ---------------
 async def build_daily_report(brigade: int, offset_days: int) -> Tuple[str, Dict[str, int], int]:
     label, frm, to = _day_bounds(offset_days)
     m = await get_deal_type_map()
@@ -167,96 +213,127 @@ async def build_daily_report(brigade: int, offset_days: int) -> Tuple[str, Dict[
     counts = {"connection":0,"repair":0,"service":0,"reconnection":0,"accident":0,"construction":0,"linework":0,"cc_request":0,"other":0}
     for d in closed:
         tname = m.get(d.get("TYPE_ID") or "", "")
-        counts[normalize_type(tname)] = counts.get(normalize_type(tname),0)+1
+        k = normalize_type(tname)
+        counts[k] = counts.get(k,0)+1
 
     stage_code = _BRIGADE_STAGE[brigade]
     active = await b24_list("crm.deal.list", order={"ID":"DESC"}, filter={"CLOSED":"N","STAGE_ID":f"C20:{stage_code}"}, select=["ID"])
     return label, counts, len(active)
 
 def format_brigade_report(brigade: int, date_label: str, counts: Dict[str, int], active_left: int) -> str:
-    total = sum(counts.get(k,0) for k,_ in BUCKETS)
+    total = counts.get("connection",0)+counts.get("service",0)+counts.get("reconnection",0)
     return "\n".join([
         f"<b>👷 Бригада №{brigade} — {date_label}</b>",
         "",
         f"<b>✅ Закрито задач:</b> {total}",
-        f"{' | '.join([f'{title} — {counts.get(key,0)}' for key,title in BUCKETS[:3]])}",
+        f"📡 Підключення — {counts.get('connection',0)} | 🛠️ Сервіс — {counts.get('service',0)} | 🔄 Перепідключення — {counts.get('reconnection',0)}",
         "",
-        f"<b>📌 Активних задач у колонці бригади:</b> {active_left}",
+        f"📌 <b>Активних задач у колонці бригади:</b> {active_left}",
     ])
 
-# ------------------------ Company summary (“дівчат” звіт) ------------------
+# ------------------------ Company summary (кат.0 + кат.20) ------------------
 async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     """
-    Збірка комбінованого звіту по CATEGORY_ID=20:
-      - “Всього подали” = створені за добу (DATE_CREATE у діапазоні)
-      - “Закрили” = переміщені у WON за добу (DATE_MODIFY у діапазоні)
-      - Сервіс: додатково відкриті, активні (у бригадних стадіях), сервісні виїзди (відкриті з UF_CRM_1611995532420 ненуль)
-      - Пропущені (cc_request): створені за добу
-      - Аварії: created/closed за добу
+    Комбінований звіт:
+      - Підключення: CATEGORY_ID=0 (created/closed)
+      - Сервіс/Перепідключення/КЦ/Аварії: CATEGORY_ID=20
     """
     label, frm, to = _day_bounds(offset_days)
     codes = await _bucket_codes()
 
+    # --- стадії за категоріями ---
+    cat0_stages = await get_category_stages(0)
+    cat20_stages = await get_category_stages(20)
+
+    won_cat0 = _won_stage_ids(cat0_stages)
+    won_cat20 = _won_stage_ids(cat20_stages)
+
+    # Kanban “вітрини” сервісу (назви можна доповнити):
+    stage_specific = set(_match_stage_id_by_name(cat20_stages, "конкрет"))          # На конкретний день
+    stage_think    = set(_match_stage_id_by_name(cat20_stages, "дума", "думають"))   # Думають
+    stage_moved    = set(_match_stage_id_by_name(cat20_stages, "перенес"))           # Перенесених
+    stage_overdue  = set(_match_stage_id_by_name(cat20_stages, "протерм", "просроч"))# Протермінованих
+
+    # “Активні у бригаді” — це відкриті у колонках бригад у кат.20
+    brigade_stage_ids = {f"C20:{v}" for v in _BRIGADE_STAGE.values()}
+
+    # ===== Підключення (CATEGORY_ID=0) =====
+    # створені
+    created_conn = await b24_list(
+        "crm.deal.list",
+        order={"ID":"DESC"},
+        filter={">=DATE_CREATE": frm, "<DATE_CREATE": to, "CATEGORY_ID": 0, "TYPE_ID": {"IN": codes.get("connection", [])}},
+        select=["ID","TYPE_ID","STAGE_ID"],
+    )
+    # закриті (WON) за добу
+    closed_conn = await b24_list(
+        "crm.deal.list",
+        order={"DATE_MODIFY":"ASC"},
+        filter={">=DATE_MODIFY": frm, "<DATE_MODIFY": to, "CATEGORY_ID": 0, "TYPE_ID": {"IN": codes.get("connection", [])}, "STAGE_ID": {"IN": won_cat0}},
+        select=["ID","TYPE_ID"],
+    )
+    connections = {"created": len(created_conn), "closed": len(closed_conn)}
+
+    # ===== Сервіс/інше (CATEGORY_ID=20) =====
     # створені за добу
-    created_all = await b24_list(
+    created_cat20 = await b24_list(
         "crm.deal.list",
         order={"ID":"DESC"},
         filter={">=DATE_CREATE": frm, "<DATE_CREATE": to, "CATEGORY_ID": 20},
         select=["ID","TYPE_ID","STAGE_ID","CLOSED","UF_CRM_1611995532420"],
     )
-
-    # закриті (WON) за добу
-    closed_all = await b24_list(
+    # закриті за добу
+    closed_cat20 = await b24_list(
         "crm.deal.list",
         order={"DATE_MODIFY":"ASC"},
-        filter={"STAGE_ID":"C20:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to},
+        filter={">=DATE_MODIFY": frm, "<DATE_MODIFY": to, "CATEGORY_ID": 20, "STAGE_ID": {"IN": won_cat20}},
         select=["ID","TYPE_ID"],
     )
-
-    # відкриті сервісні (для extended метрик)
-    open_service = await b24_list(
+    # відкриті у кат.20 (для сервісної статистики)
+    open_cat20 = await b24_list(
         "crm.deal.list",
         order={"ID":"DESC"},
-        filter={"CLOSED":"N","CATEGORY_ID":20, "TYPE_ID": codes.get("service", [])},
-        select=["ID","STAGE_ID","UF_CRM_1611995532420"],
+        filter={"CLOSED":"N", "CATEGORY_ID": 20},
+        select=["ID","TYPE_ID","STAGE_ID","UF_CRM_1611995532420"],
     )
 
-    # рахунки по кошиках
-    def _count_created(bucket: str) -> int:
+    def _count_created20(bucket: str) -> int:
         valid = set(codes.get(bucket, []))
-        return sum(1 for d in created_all if (d.get("TYPE_ID") in valid))
-    def _count_closed(bucket: str) -> int:
+        return sum(1 for d in created_cat20 if d.get("TYPE_ID") in valid)
+
+    def _count_closed20(bucket: str) -> int:
         valid = set(codes.get(bucket, []))
-        return sum(1 for d in closed_all if (d.get("TYPE_ID") in valid))
+        return sum(1 for d in closed_cat20 if d.get("TYPE_ID") in valid)
 
-    # сервіс розширений
-    service_open_total = len(open_service)
-    brigade_stage_ids = {f"C20:{v}" for v in _BRIGADE_STAGE.values()}
-    service_active = sum(1 for d in open_service if (str(d.get("STAGE_ID") or "") in brigade_stage_ids))
-    service_trips = sum(1 for d in open_service if (d.get("UF_CRM_1611995532420") or []))
+    # --- сервіс ---
+    service = {
+        "created": _count_created20("service"),
+        "closed": _count_closed20("service"),
+        "open_total": sum(1 for d in open_cat20 if d.get("TYPE_ID") in set(codes.get("service", []))),
+        "active": sum(1 for d in open_cat20 if (d.get("TYPE_ID") in set(codes.get("service", [])) and str(d.get("STAGE_ID")) in brigade_stage_ids)),
+        "service_trips": sum(1 for d in open_cat20 if (d.get("TYPE_ID") in set(codes.get("service", [])) and d.get("UF_CRM_1611995532420"))),
+        "moved": sum(1 for d in open_cat20 if str(d.get("STAGE_ID")) in stage_moved),
+        "overdue": sum(1 for d in open_cat20 if str(d.get("STAGE_ID")) in stage_overdue),
+        "specific_day": sum(1 for d in open_cat20 if str(d.get("STAGE_ID")) in stage_specific),
+        "thinking": sum(1 for d in open_cat20 if str(d.get("STAGE_ID")) in stage_think),
+    }
 
-    # пропущені / КЦ (за добу створено)
-    cc_created = _count_created("cc_request")
+    # --- перепідключення (кат.20) — у звіті тільки "закрили"
+    reconnections = {"created": _count_created20("reconnection"), "closed": _count_closed20("reconnection")}
 
-    # аварії: X/Y (закрито/створено за добу)
-    accidents_created = _count_created("accident")
-    accidents_closed = _count_closed("accident")
+    # --- КЦ (пропущені) — створені за добу у кат.20
+    cc_requests = _count_created20("cc_request")
+
+    # --- аварії X/Y у кат.20
+    accidents = {"created": _count_created20("accident"), "closed": _count_closed20("accident")}
 
     return {
         "date_label": label,
-        "connections": {"created": _count_created("connection"), "closed": _count_closed("connection")},
-        "service": {
-            "created": _count_created("service"),
-            "closed": _count_closed("service"),
-            "open_total": service_open_total,
-            "active": service_active,
-            "service_trips": service_trips,
-            "moved": 0,          # немає надійного критерію — залишаю 0
-            "overdue": 0,        # потребує окремого поля-дедлайну — залишаю 0
-        },
-        "reconnections": {"created": _count_created("reconnection"), "closed": _count_closed("reconnection")},
-        "cc_requests": cc_created,
-        "accidents": {"created": accidents_created, "closed": accidents_closed},
+        "connections": connections,
+        "service": service,
+        "reconnections": reconnections,
+        "cc_requests": cc_requests,
+        "accidents": accidents,
     }
 
 def format_company_summary(d: Dict[str, Any]) -> str:
@@ -270,7 +347,6 @@ def format_company_summary(d: Dict[str, Any]) -> str:
         "📌 <b>Підключення</b>",
         f"Всього подали — <b>{c['created']}</b>",
         f"Закрили — <b>{c['closed']}</b>",
-        # “Запл. на завтра” — ігноруємо
         "",
         "📌 <b>Сервіс</b>",
         f"Подали — <b>{s['created']}</b>",
@@ -282,9 +358,11 @@ def format_company_summary(d: Dict[str, Any]) -> str:
         f"Перенесених — <b>{s['moved']}</b>",
         f"Протермінованих — <b>{s['overdue']}</b>",
         "",
+        f"На конкретний день — <b>{s['specific_day']}</b>",
+        f"Думають — <b>{s['thinking']}</b>",
+        "",
         "📌 <b>Перепідключення</b>",
         f"Закрили — <b>{r['closed']}</b>",
-        # “Запл. на завтра” — ігноруємо
         "",
         f"📞 Пропущені — <b>{cc}</b>",
         f"⚠️ Аварії — <b>{acc['closed']}</b>/<b>{acc['created']}</b>",
@@ -293,7 +371,7 @@ def format_company_summary(d: Dict[str, Any]) -> str:
 
 # ------------------------ Send helpers -------------------
 async def _safe_send(chat_id: int, text: str):
-    for attempt in range(5):
+    for attempt in range(6):
         try:
             await bot.send_message(chat_id, text, disable_web_page_preview=True)
             return
@@ -304,7 +382,7 @@ async def _safe_send(chat_id: int, text: str):
 
 def _resolve_chat_for_brigade(b: int) -> Optional[int]:
     if str(b) in REPORT_CHATS: return int(REPORT_CHATS[str(b)])
-    if b in REPORT_CHATS: return int(REPORT_CHATS[b])  # якщо JSON передали числами
+    if b in REPORT_CHATS: return int(REPORT_CHATS[b])
     if "all" in REPORT_CHATS: return int(REPORT_CHATS["all"])
     return None
 
@@ -407,4 +485,4 @@ async def telegram_webhook(secret: str, request: Request):
         return {"ok": False}
     update = Update.model_validate(await request.json())
     await dp.feed_update(bot, update)
-    return {"ok": True}
+    return {"ok": True"}
