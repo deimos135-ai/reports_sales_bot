@@ -485,4 +485,4 @@ async def telegram_webhook(secret: str, request: Request):
         return {"ok": False}
     update = Update.model_validate(await request.json())
     await dp.feed_update(bot, update)
-    return {"ok": True"}
+    return {"ok": True}
