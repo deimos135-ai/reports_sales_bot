@@ -98,7 +98,6 @@ _BRIGADE_EXEC_OPTION_ID = {1: 5494, 2: 5496, 3: 5498, 4: 5500, 5: 5502}
 _BRIGADE_EXEC_SET = set(_BRIGADE_EXEC_OPTION_ID.values())
 
 def _extract_exec_vals(uf_val) -> set:
-    """Допоміжне: привести UF_CRM_1611995532420 у множину int."""
     try:
         if isinstance(uf_val, list):
             return {int(x) for x in uf_val if str(x).isdigit()}
@@ -133,8 +132,8 @@ async def _resolve_cat0_stage_ids() -> Tuple[str, str]:
         n = (nm or "").strip().lower()
         if n == "на конкретний день": exact_id = sid
         if n == "думають": think_id = sid
-    if not exact_id: exact_id = "5"         # fallback з твого дампу
-    if not think_id: think_id = "DETAILS"   # fallback з твого дампу
+    if not exact_id: exact_id = "5"
+    if not think_id: think_id = "DETAILS"
     return f"C0:{exact_id}", f"C0:{think_id}"
 
 async def _count_open_in_stage(cat_id: int, stage_full: str) -> int:
@@ -145,7 +144,6 @@ async def _count_open_in_stage(cat_id: int, stage_full: str) -> int:
         select=["ID"],
     )
     if deals: return len(deals)
-    # fallback: короткий STAGE_ID
     short = stage_full.split(":", 1)[-1]
     deals_fb = await b24_list(
         "crm.deal.list",
@@ -160,43 +158,37 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     label, frm, to = _day_bounds(offset_days)
     type_map = await get_deal_type_map()
 
-    brigade_stage_ids = {f"C20:{v}" for v in _BRIGADE_STAGE.values()}
+    brigade_stage_ids = [f"C20:{v}" for v in _BRIGADE_STAGE.values()]
+    brigade_stage_set = set(brigade_stage_ids)
 
-    # created today (cat20) — тільки бригадні: стоять у бригадній колонці або мають UF опцію бригади
+    # 🆕 Подали — підключення, які СЬОГОДНІ потрапили у бригадні колонки (тобто мають STAGE_ID ∈ бригадних і змінювалися сьогодні)
     created_conn = 0
-    created = await b24_list(
-        "crm.deal.list",
-        order={"ID": "DESC"},
-        filter={">=DATE_CREATE": frm, "<DATE_CREATE": to, "CATEGORY_ID": 20},
-        select=["ID", "TYPE_ID", "STAGE_ID", "UF_CRM_1611995532420"],
-    )
-    for d in created:
-        tid = d.get("TYPE_ID") or ""
-        if not _is_connection(tid, type_map.get(tid)):
-            continue
-        stage_ok = str(d.get("STAGE_ID") or "") in brigade_stage_ids
-        exec_vals = _extract_exec_vals(d.get("UF_CRM_1611995532420"))
-        exec_ok = bool(exec_vals & _BRIGADE_EXEC_SET)
-        if stage_ok or exec_ok:
-            created_conn += 1
+    for st in brigade_stage_ids:
+        created = await b24_list(
+            "crm.deal.list",
+            order={"DATE_MODIFY": "ASC"},
+            filter={"STAGE_ID": st, "CATEGORY_ID": 20, ">=DATE_MODIFY": frm, "<DATE_MODIFY": to},
+            select=["ID", "TYPE_ID"],
+        )
+        for d in created:
+            tid = d.get("TYPE_ID") or ""
+            if _is_connection(tid, type_map.get(tid)):
+                created_conn += 1
 
-    # closed today (cat20 WON) — тільки бригадні: перевіряємо UF опцію бригади
+    # ✅ Закрили — всі підключення в C20, що стали WON сьогодні (без вимоги UF опції)
     closed_conn = 0
     closed = await b24_list(
         "crm.deal.list",
         order={"DATE_MODIFY": "ASC"},
         filter={"STAGE_ID": "C20:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to},
-        select=["ID", "TYPE_ID", "UF_CRM_1611995532420"],
+        select=["ID", "TYPE_ID"],
     )
     for d in closed:
         tid = d.get("TYPE_ID") or ""
-        if not _is_connection(tid, type_map.get(tid)):
-            continue
-        exec_vals = _extract_exec_vals(d.get("UF_CRM_1611995532420"))
-        if exec_vals & _BRIGADE_EXEC_SET:
+        if _is_connection(tid, type_map.get(tid)):
             closed_conn += 1
 
-    # active on brigades (open in brigade stages)
+    # 📊 Активні на бригадах — відкриті підключення, що зараз у бригадних колонках
     active_conn = 0
     open_cat20 = await b24_list(
         "crm.deal.list",
@@ -205,17 +197,17 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
         select=["ID", "TYPE_ID", "STAGE_ID"],
     )
     for d in open_cat20:
-        if str(d.get("STAGE_ID") or "") in brigade_stage_ids:
+        if str(d.get("STAGE_ID") or "") in brigade_stage_set:
             tid = d.get("TYPE_ID") or ""
             if _is_connection(tid, type_map.get(tid)):
                 active_conn += 1
 
-    # category 0: exact day & think
+    # Категорія 0 — «На конкретний день» та «Думають»
     c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
     exact_cnt = await _count_open_in_stage(0, c0_exact_stage)
     think_cnt = await _count_open_in_stage(0, c0_think_stage)
 
-    log.info("[summary] created=%s, closed=%s, active=%s, exact=%s, think=%s",
+    log.info("[summary] created(staged_today)=%s, closed=%s, active=%s, exact=%s, think=%s",
              created_conn, closed_conn, active_conn, exact_cnt, think_cnt)
 
     return {
@@ -287,9 +279,7 @@ async def report_now(m: Message):
         offset = int(parts[1])
 
     await m.answer("🔄 Формую сумарний звіт…")
-    # 1) завжди відповідаємо в той чат, де команда
     await send_company_summary_to_chat(m.chat.id, offset)
-    # 2) додатково — у службовий чат, якщо налаштований і він інший
     if REPORT_SUMMARY_CHAT and REPORT_SUMMARY_CHAT != m.chat.id:
         await send_company_summary_to_chat(REPORT_SUMMARY_CHAT, offset)
     await m.answer("✅ Готово")
