@@ -1,7 +1,7 @@
-# main.py — Fiber Reports (summary-only, safer sending & direct reply)
+# main.py — Fiber Reports (summary-only, dedup fix & optional debug IDs)
 import asyncio, html, json, logging, os
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import aiohttp
 from fastapi import FastAPI, Request
@@ -22,7 +22,8 @@ REPORT_TZ_NAME = os.environ.get("REPORT_TZ", "Europe/Kyiv")
 REPORT_TZ = ZoneInfo(REPORT_TZ_NAME)
 REPORT_TIME = os.environ.get("REPORT_TIME", "19:00")  # HH:MM
 
-REPORT_SUMMARY_CHAT = int(os.environ.get("REPORT_SUMMARY_CHAT", "0"))  # опційно
+REPORT_SUMMARY_CHAT = int(os.environ.get("REPORT_SUMMARY_CHAT", "0"))  # optional
+DEBUG_IDS = os.environ.get("DEBUG_IDS", "0") == "1"
 
 # ------------------------ Logging -------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -92,18 +93,8 @@ def _is_connection(type_id: str, type_name: Optional[str] = None) -> bool:
         name = (_DEAL_TYPE_MAP.get(type_id, "") or "").strip().lower()
     return name in ("підключення", "подключение") or ("підключ" in name) or ("подключ" in name)
 
-# бригадні стадії (Кат.20) і опції виконання (UF)
+# Brigade stages (cat.20)
 _BRIGADE_STAGE = {1: "UC_XF8O6V", 2: "UC_0XLPCN", 3: "UC_204CP3", 4: "UC_TNEW3Z", 5: "UC_RMBZ37"}
-_BRIGADE_EXEC_OPTION_ID = {1: 5494, 2: 5496, 3: 5498, 4: 5500, 5: 5502}
-_BRIGADE_EXEC_SET = set(_BRIGADE_EXEC_OPTION_ID.values())
-
-def _extract_exec_vals(uf_val) -> set:
-    try:
-        if isinstance(uf_val, list):
-            return {int(x) for x in uf_val if str(x).isdigit()}
-        return {int(uf_val)} if uf_val and str(uf_val).isdigit() else set()
-    except Exception:
-        return set()
 
 # ------------------------ Time helpers -------------------
 def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str]:
@@ -132,8 +123,8 @@ async def _resolve_cat0_stage_ids() -> Tuple[str, str]:
         n = (nm or "").strip().lower()
         if n == "на конкретний день": exact_id = sid
         if n == "думають": think_id = sid
-    if not exact_id: exact_id = "5"
-    if not think_id: think_id = "DETAILS"
+    if not exact_id: exact_id = "5"         # fallback by your dump
+    if not think_id: think_id = "DETAILS"   # fallback by your dump
     return f"C0:{exact_id}", f"C0:{think_id}"
 
 async def _count_open_in_stage(cat_id: int, stage_full: str) -> int:
@@ -144,6 +135,7 @@ async def _count_open_in_stage(cat_id: int, stage_full: str) -> int:
         select=["ID"],
     )
     if deals: return len(deals)
+    # fallback for short code
     short = stage_full.split(":", 1)[-1]
     deals_fb = await b24_list(
         "crm.deal.list",
@@ -161,32 +153,56 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     brigade_stage_ids = [f"C20:{v}" for v in _BRIGADE_STAGE.values()]
     brigade_stage_set = set(brigade_stage_ids)
 
-    # 🆕 Подали — підключення, які СЬОГОДНІ потрапили у бригадні колонки (тобто мають STAGE_ID ∈ бригадних і змінювалися сьогодні)
-    created_conn = 0
-    for st in brigade_stage_ids:
-        created = await b24_list(
+    # 🆕 Подали — УНІКАЛЬНІ підключення, які СЬОГОДНІ знаходились у будь-якій бригадній колонці (за DATE_MODIFY)
+    created_conn_ids: Set[int] = set()
+    # Один запит з масивом стадій (Bitrix приймає масиви у фільтрі) — якщо раптом не спрацює у вашому порталі, залишимо безпечний цикл.
+    try:
+        created_bulk = await b24_list(
             "crm.deal.list",
             order={"DATE_MODIFY": "ASC"},
-            filter={"STAGE_ID": st, "CATEGORY_ID": 20, ">=DATE_MODIFY": frm, "<DATE_MODIFY": to},
+            filter={
+                "CATEGORY_ID": 20,
+                "STAGE_ID": brigade_stage_ids,  # список-умова IN
+                ">=DATE_MODIFY": frm,
+                "<DATE_MODIFY": to,
+            },
             select=["ID", "TYPE_ID"],
         )
-        for d in created:
+        for d in created_bulk:
             tid = d.get("TYPE_ID") or ""
             if _is_connection(tid, type_map.get(tid)):
-                created_conn += 1
+                try: created_conn_ids.add(int(d["ID"]))
+                except: pass
+    except Exception as e:
+        log.warning("bulk STAGE_ID filter failed, fallback per-stage: %s", e)
+        for st in brigade_stage_ids:
+            created = await b24_list(
+                "crm.deal.list",
+                order={"DATE_MODIFY": "ASC"},
+                filter={"CATEGORY_ID": 20, "STAGE_ID": st, ">=DATE_MODIFY": frm, "<DATE_MODIFY": to},
+                select=["ID", "TYPE_ID"],
+            )
+            for d in created:
+                tid = d.get("TYPE_ID") or ""
+                if _is_connection(tid, type_map.get(tid)):
+                    try: created_conn_ids.add(int(d["ID"]))
+                    except: pass
+    created_conn = len(created_conn_ids)
 
-    # ✅ Закрили — всі підключення в C20, що стали WON сьогодні (без вимоги UF опції)
-    closed_conn = 0
+    # ✅ Закрили — всі підключення в C20, що стали WON сьогодні
+    closed_conn_ids: Set[int] = set()
     closed = await b24_list(
         "crm.deal.list",
         order={"DATE_MODIFY": "ASC"},
-        filter={"STAGE_ID": "C20:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to},
+        filter={"CATEGORY_ID": 20, "STAGE_ID": "C20:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to},
         select=["ID", "TYPE_ID"],
     )
     for d in closed:
         tid = d.get("TYPE_ID") or ""
         if _is_connection(tid, type_map.get(tid)):
-            closed_conn += 1
+            try: closed_conn_ids.add(int(d["ID"]))
+            except: pass
+    closed_conn = len(closed_conn_ids)
 
     # 📊 Активні на бригадах — відкриті підключення, що зараз у бригадних колонках
     active_conn = 0
@@ -207,7 +223,11 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     exact_cnt = await _count_open_in_stage(0, c0_exact_stage)
     think_cnt = await _count_open_in_stage(0, c0_think_stage)
 
-    log.info("[summary] created(staged_today)=%s, closed=%s, active=%s, exact=%s, think=%s",
+    if DEBUG_IDS:
+        log.info("[DEBUG_IDS] created_conn_ids=%s", sorted(created_conn_ids))
+        log.info("[DEBUG_IDS] closed_conn_ids=%s", sorted(closed_conn_ids))
+
+    log.info("[summary] created(unique)=%s, closed=%s, active=%s, exact=%s, think=%s",
              created_conn, closed_conn, active_conn, exact_cnt, think_cnt)
 
     return {
@@ -269,10 +289,6 @@ async def send_company_summary(offset_days: int = 0) -> None:
 # ------------------------ Manual command -----------------
 @dp.message(Command("report_now"))
 async def report_now(m: Message):
-    """
-    /report_now           — сумарний за сьогодні в цей же чат
-    /report_now 1         — сумарний за вчора в цей же чат
-    """
     parts = (m.text or "").split()
     offset = 0
     if len(parts) >= 2 and parts[1].lstrip("-").isdigit():
