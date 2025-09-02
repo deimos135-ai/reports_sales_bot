@@ -1,4 +1,5 @@
-# main.py — reports-bot (тільки сумарний звіт по Підключеннях)
+# main.py — Fiber "sales" reports-bot (summary only)
+
 import asyncio
 import html
 import json
@@ -26,9 +27,16 @@ REPORT_TZ_NAME = os.environ.get("REPORT_TZ", "Europe/Kyiv")
 REPORT_TZ = ZoneInfo(REPORT_TZ_NAME)
 REPORT_TIME = os.environ.get("REPORT_TIME", "19:00")  # HH:MM
 
+# Куди слати сумарний звіт
+# - REPORT_SUMMARY_CHAT: один чат (int)
+# - або REPORT_CHATS='{"all": -100...}' — fallback
 _raw_report_chats = os.environ.get("REPORT_CHATS", "")
 REPORT_CHATS: Dict[str, int] = json.loads(_raw_report_chats) if _raw_report_chats.strip() else {}
-REPORT_SUMMARY_CHAT = int(os.environ.get("REPORT_SUMMARY_CHAT", "0"))  # якщо 0 — беремо REPORT_CHATS["all"]
+REPORT_SUMMARY_CHAT = int(os.environ.get("REPORT_SUMMARY_CHAT", "0"))
+
+# ENV-переоприділення для стадій кат.0 (не обов’язково)
+CAT0_EXACT_DAY_STAGE_ID = os.environ.get("CAT0_EXACT_DAY_STAGE_ID", "").strip()   # напр. C0:5
+CAT0_THINK_STAGE_ID     = os.environ.get("CAT0_THINK_STAGE_ID", "").strip()       # напр. C0:DETAILS
 
 # ------------------------ Logging -------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -58,7 +66,7 @@ async def b24(method: str, **params) -> Any:
                 if "error" in data:
                     err = data["error"]; desc = data.get("error_description")
                     if err in ("QUERY_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS", "INTERNAL_SERVER_ERROR"):
-                        log.warning("Bitrix temporary error: %s (%s), retry #%s", err, desc, attempt+1)
+                        log.warning("Bitrix transient: %s (%s), retry #%s", err, desc, attempt+1)
                         await _sleep_backoff(attempt); continue
                     raise RuntimeError(f"B24 error: {err}: {desc}")
                 return data.get("result")
@@ -82,7 +90,7 @@ async def b24_list(method: str, *, page_size: int = 200, throttle: float = 0.15,
         if throttle: await asyncio.sleep(throttle)
     return out
 
-# ------------------------ Caches / mappings ---------------
+# ------------------------ Caches --------------------------
 _DEAL_TYPE_MAP: Optional[Dict[str, str]] = None
 async def get_deal_type_map() -> Dict[str, str]:
     global _DEAL_TYPE_MAP
@@ -92,51 +100,13 @@ async def get_deal_type_map() -> Dict[str, str]:
         log.info("[cache] DEAL_TYPE: %s", len(_DEAL_TYPE_MAP))
     return _DEAL_TYPE_MAP
 
-def normalize_type(type_name: str) -> str:
-    t = (type_name or "").strip().lower()
-    if t in {"підключення","подключение"}: return "connection"
-    if "підключ" in t or "подключ" in t: return "connection"
-    return "other"
-
-async def get_type_ids(bucket: str) -> List[str]:
-    """список TYPE_ID для кошика ('connection')."""
-    m = await get_deal_type_map()
-    return [code for code, name in m.items() if normalize_type(name) == bucket]
-
-# --- cache stages per category + helpers ---
-_CAT_STAGES: Dict[int, List[Dict[str, str]]] = {}
-
-async def get_category_stages(cat_id: int) -> List[Dict[str, str]]:
-    global _CAT_STAGES
+_CAT_STAGES: Dict[int, List[Dict[str, Any]]] = {}
+async def get_category_stages(cat_id: int) -> List[Dict[str, Any]]:
     if cat_id not in _CAT_STAGES:
-        items = await b24("crm.dealcategory.stage.list", filter={"CATEGORY_ID": cat_id})
-        _CAT_STAGES[cat_id] = items or []
+        st = await b24("crm.dealcategory.stage.list", id=cat_id)
+        _CAT_STAGES[cat_id] = st or []
         log.info("[cache] CAT%s stages: %s", cat_id, len(_CAT_STAGES[cat_id]))
     return _CAT_STAGES[cat_id]
-
-async def find_stage_code_by_name_contains(cat_id: int, needle: str) -> Optional[str]:
-    stages = await get_category_stages(cat_id)
-    n = (needle or "").strip().lower()
-    for s in stages:
-        name = (s.get("NAME") or "").strip().lower()
-        if n in name:
-            sid = s.get("STATUS_ID")
-            if sid:
-                return f"C{cat_id}:{sid}"
-    return None
-
-async def count_open_in_stage(cat_id: int, stage_code: Optional[str], *, type_ids: Optional[List[str]]) -> int:
-    """
-    Рахує відкриті угоди у конкретній стадії.
-    Якщо type_ids=None — НЕ фільтруємо по TYPE_ID (використовуємо для категорії 0).
-    """
-    if not stage_code:
-        return 0
-    flt: Dict[str, Any] = {"CLOSED": "N", "CATEGORY_ID": cat_id, "STAGE_ID": stage_code}
-    if type_ids is not None and len(type_ids) > 0:
-        flt["TYPE_ID"] = type_ids
-    deals = await b24_list("crm.deal.list", order={"ID": "DESC"}, filter=flt, select=["ID"])
-    return len(deals)
 
 # ------------------------ Time helpers -------------------
 def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str]:
@@ -144,85 +114,151 @@ def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str]:
     start_local = (now_local - timedelta(days=offset_days)).replace(hour=0, minute=0, second=0, microsecond=0)
     end_local = start_local + timedelta(days=1)
     start_utc = start_local.astimezone(timezone.utc)
-    end_utc = end_local.astimezone(timezone.utc)
+    end_utc   = end_local.astimezone(timezone.utc)
     label = start_local.strftime("%d.%m.%Y")
     return label, start_utc.isoformat(), end_utc.isoformat()
 
-# ------------------------ Company summary (ПІДКЛЮЧЕННЯ) ---------------
-async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
-    """
-    Підключення:
-      • подані сьогодні (cat=20, DATE_CREATE)
-      • закриті сьогодні (cat=20, STAGE=WON, DATE_MODIFY)
-      • активні на бригадах (cat=20, відкриті, STAGE ∈ бригадних)
-      • на конкретний день (cat=0, відкриті, стадія — без фільтру TYPE_ID)
-      • думають (cat=0, відкриті, стадія — без фільтру TYPE_ID)
-    """
-    label, frm, to = _day_bounds(offset_days)
-    type_conn = await get_type_ids("connection")
+# ------------------------ “Підключення” rules ------------
+# Бригадні стадії (кат.20)
+_BRIGADE_STAGE = {"UC_XF8O6V", "UC_0XLPCN", "UC_204CP3", "UC_TNEW3Z", "UC_RMBZ37"}
 
-    # --- cat=20: подані сьогодні
+def _is_connection(type_id: str, type_map: Dict[str, str]) -> bool:
+    name = (type_map.get(type_id or "", "") or "").strip().lower()
+    return "підключ" in name or "подключ" in name
+
+# ------------------------ CAT0 exact-day / think ----------
+def _stage_code(cat_id: int, status_id: str) -> str:
+    return f"C{cat_id}:{status_id}"
+
+async def _resolve_cat0_stage_ids() -> Tuple[str, str]:
+    """Повертає (C0:5, C0:DETAILS) з ENV або з довідника Bitrix."""
+    exact_day = CAT0_EXACT_DAY_STAGE_ID
+    think     = CAT0_THINK_STAGE_ID
+    if exact_day and think:
+        return exact_day, think
+
+    stages = await get_category_stages(0)
+    sid_exact = None
+    sid_think = None
+    for s in stages:
+        sid = s.get("STATUS_ID", "")
+        nm  = (s.get("NAME", "") or "").lower()
+        if sid == "5" or "конкретний день" in nm:
+            sid_exact = sid
+        if sid == "DETAILS" or "дума" in nm:
+            sid_think = sid
+    # fallback до відомих значень
+    sid_exact = sid_exact or "5"
+    sid_think = sid_think or "DETAILS"
+    return _stage_code(0, sid_exact), _stage_code(0, sid_think)
+
+# ------------------------ Company summary -----------------
+async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
+    label, frm, to = _day_bounds(offset_days)
+    type_map = await get_deal_type_map()
+
+    # 1) Підключення — подали сьогодні (кат.20)
     created_cat20 = await b24_list(
         "crm.deal.list",
-        order={"ID":"DESC"},
-        filter={">=DATE_CREATE": frm, "<DATE_CREATE": to, "CATEGORY_ID": 20, "TYPE_ID": type_conn},
-        select=["ID"],
+        order={"ID": "DESC"},
+        filter={">=DATE_CREATE": frm, "<DATE_CREATE": to, "CATEGORY_ID": 20},
+        select=["ID", "TYPE_ID"],
     )
+    conn_created = sum(1 for d in created_cat20 if _is_connection(d.get("TYPE_ID"), type_map))
 
-    # --- cat=20: закриті сьогодні
+    # 2) Підключення — закрили сьогодні (кат.20 → WON)
     closed_cat20 = await b24_list(
         "crm.deal.list",
-        order={"DATE_MODIFY":"ASC"},
-        filter={"STAGE_ID":"C20:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to, "TYPE_ID": type_conn},
+        order={"DATE_MODIFY": "ASC"},
+        filter={"STAGE_ID": "C20:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to},
+        select=["ID", "TYPE_ID"],
+    )
+    conn_closed = sum(1 for d in closed_cat20 if _is_connection(d.get("TYPE_ID"), type_map))
+
+    # 3) Підключення — активні на бригадах (кат.20, відкриті, стадія ∈ бригадні)
+    brigade_stage_ids = {f"C20:{x}" for x in _BRIGADE_STAGE}
+    open_cat20 = await b24_list(
+        "crm.deal.list",
+        order={"ID": "DESC"},
+        filter={"CLOSED": "N", "CATEGORY_ID": 20},
+        select=["ID", "TYPE_ID", "STAGE_ID"],
+    )
+    conn_active = sum(
+        1 for d in open_cat20
+        if (d.get("STAGE_ID") in brigade_stage_ids and _is_connection(d.get("TYPE_ID"), type_map))
+    )
+
+    # 4) Категорія 0 — «На конкретний день» та «Думають» (поточні відкриті)
+    c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
+
+    # «На конкретний день»
+    cat0_exact = await b24_list(
+        "crm.deal.list",
+        order={"ID": "DESC"},
+        filter={"CLOSED": "N", "CATEGORY_ID": 0, "STAGE_ID": c0_exact_stage},
         select=["ID"],
     )
-
-    # --- cat=20: активні на бригадах
-    open_conn_cat20 = await b24_list(
+    # «Думають»
+    cat0_think = await b24_list(
         "crm.deal.list",
-        order={"ID":"DESC"},
-        filter={"CLOSED":"N","CATEGORY_ID":20, "TYPE_ID": type_conn},
-        select=["ID","STAGE_ID"],
+        order={"ID": "DESC"},
+        filter={"CLOSED": "N", "CATEGORY_ID": 0, "STAGE_ID": c0_think_stage},
+        select=["ID"],
     )
-    # якщо колонки бригад названі через кастомні коди — впишіть тут
-    BRIGADE_STAGE_CODES = {"UC_XF8O6V","UC_0XLPCN","UC_204CP3","UC_TNEW3Z","UC_RMBZ37"}
-    brigade_stage_ids = {f"C20:{v}" for v in BRIGADE_STAGE_CODES}
-    active_brigades = sum(1 for d in open_conn_cat20 if (str(d.get("STAGE_ID") or "") in brigade_stage_ids))
-
-    # --- cat=0: "на конкретний день" та "думають" (без TYPE_ID!)
-    stage_specific_day = await find_stage_code_by_name_contains(0, "конкретн")
-    stage_thinking     = await find_stage_code_by_name_contains(0, "дума")
-    cnt_specific_day = await count_open_in_stage(0, stage_specific_day, type_ids=None)
-    cnt_thinking      = await count_open_in_stage(0, stage_thinking,     type_ids=None)
 
     return {
         "date_label": label,
         "connections": {
-            "created_cat20": len(created_cat20),
-            "closed_cat20": len(closed_cat20),
-            "active_brigades_cat20": active_brigades,
-            "specific_day_cat0": cnt_specific_day,
-            "thinking_cat0": cnt_thinking,
+            "created": conn_created,
+            "closed":  conn_closed,
+            "active":  conn_active,
+        },
+        "cat0": {
+            "exact_day": len(cat0_exact),
+            "think":     len(cat0_think),
         },
     }
 
 def format_company_summary(d: Dict[str, Any]) -> str:
     dl = d["date_label"]
-    c = d["connections"]
+    c  = d["connections"]
+    k0 = d["cat0"]
     lines = [
-        f"📅 <b>Дата: {dl}</b>",
+        f"🗓 <b>Дата: {dl}</b>",
         "",
         "📌 <b>Підключення</b>",
-        f"Всього подали (кат.20) — <b>{c['created_cat20']}</b>",
-        f"Закрили сьогодні (кат.20) — <b>{c['closed_cat20']}</b>",
-        f"Активних на бригадах (кат.20) — <b>{c['active_brigades_cat20']}</b>",
+        f"Всього подали (кат.20) — <b>{c['created']}</b>",
+        f"Закрили сьогодні (кат.20) — <b>{c['closed']}</b>",
+        f"Активних на бригадах (кат.20) — <b>{c['active']}</b>",
         "",
-        f"На конкретний день (кат.0) — <b>{c['specific_day_cat0']}</b>",
-        f"Думають (кат.0) — <b>{c['thinking_cat0']}</b>",
+        f"На конкретний день (кат.0) — <b>{k0['exact_day']}</b>",
+        f"Думають (кат.0) — <b>{k0['think']}</b>",
     ]
     return "\n".join(lines)
 
-# ------------------------ Send helpers -------------------
+# ------------------------ Utilities -----------------------
+def _pad(s: str, n: int) -> str:
+    s = str(s or ""); return s + " " * max(0, n - len(s))
+
+async def render_category_stages_table(cat_id: int) -> str:
+    stages = await get_category_stages(cat_id)
+    rows = [(s.get("STATUS_ID", ""), s.get("NAME", "")) for s in stages]
+    w_id = max([len("STATUS_ID")] + [len(x[0]) for x in rows]) + 2
+    w_nm = max([len("NAME")] + [len(x[1]) for x in rows]) + 2
+    out = []
+    out.append(f"Категорія: {cat_id}\n")
+    out.append("<code>")
+    out.append(_pad("STATUS_ID", w_id) + _pad("NAME", w_nm))
+    out.append(_pad("-" * len("STATUS_ID"), w_id) + _pad("-" * len("NAME"), w_nm))
+    for sid, name in rows: out.append(_pad(sid, w_id) + _pad(name, w_nm))
+    out.append("</code>")
+    return "\n".join(out)
+
+def _resolve_summary_chat() -> Optional[int]:
+    if REPORT_SUMMARY_CHAT: return REPORT_SUMMARY_CHAT
+    if "all" in REPORT_CHATS: return int(REPORT_CHATS["all"])
+    return None
+
 async def _safe_send(chat_id: int, text: str):
     for attempt in range(5):
         try:
@@ -232,11 +268,6 @@ async def _safe_send(chat_id: int, text: str):
             log.warning("telegram send failed: %s, retry #%s", e, attempt+1)
             await _sleep_backoff(attempt)
     log.error("telegram send failed permanently")
-
-def _resolve_summary_chat() -> Optional[int]:
-    if REPORT_SUMMARY_CHAT: return REPORT_SUMMARY_CHAT
-    if "all" in REPORT_CHATS: return int(REPORT_CHATS["all"])
-    return None
 
 async def send_company_summary(offset_days: int = 0) -> None:
     chat_id = _resolve_summary_chat()
@@ -248,53 +279,29 @@ async def send_company_summary(offset_days: int = 0) -> None:
         await _safe_send(chat_id, format_company_summary(data))
     except Exception:
         log.exception("company summary failed")
-        await _safe_send(chat_id, "❗️Помилка формування комбінованого звіту")
-    
-# ---- ADD: pretty table for category stages ---------------------------------
-def _pad(s: str, n: int) -> str:
-    s = str(s or "")
-    return s + " " * max(0, n - len(s))
+        await _safe_send(chat_id, "❗️Помилка формування сумарного звіту")
 
-async def render_category_stages_table(cat_id: int) -> str:
-    """
-    Повертає текст з таблицею стадій для категорії cat_id:
-    колонки: STATUS_ID, NAME
-    """
-    stages = await get_category_stages(cat_id)
-    rows = [(s.get("STATUS_ID", ""), s.get("NAME", "")) for s in stages]
+# ------------------------ Commands -----------------------
+@dp.message(Command("report_now"))
+async def report_now(m: Message):
+    # /report_now         — за сьогодні
+    # /report_now 1       — за вчора
+    parts = (m.text or "").split()
+    try:
+        offset = int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        offset = 0
+    await m.answer("🔄 Формую сумарний звіт…")
+    await send_company_summary(offset)
+    await m.answer("✅ Готово")
 
-    # розміри колонок
-    w_id = max([len("STATUS_ID")] + [len(x[0]) for x in rows]) + 2
-    w_nm = max([len("NAME")] + [len(x[1]) for x in rows]) + 2
-
-    # збираємо таблицю у code-block
-    out = []
-    out.append(f"Категорія: {cat_id}\n")
-    out.append("<code>")
-    out.append(_pad("STATUS_ID", w_id) + _pad("NAME", w_nm))
-    out.append(_pad("-" * len("STATUS_ID"), w_id) + _pad("-" * len("NAME"), w_nm))
-    for sid, name in rows:
-        out.append(_pad(sid, w_id) + _pad(name, w_nm))
-    out.append("</code>")
-    out.append(
-        "\nПорада: знайди тут точні назви колонок для "
-        "«На конкретний день» та «Думають» і впиши їх у match-логіку."
-    )
-    return "\n".join(out)
-
-# ---- ADD: command handler to print stages -----------------------------------
 @dp.message(Command("cat_stages"))
 async def cmd_cat_stages(m: Message):
-    """
-    /cat_stages          -> покаже стадії категорії 0
-    /cat_stages 20       -> покаже стадії категорії 20
-    """
     parts = (m.text or "").split()
     try:
         cat_id = int(parts[1]) if len(parts) > 1 else 0
     except ValueError:
         cat_id = 0
-
     await m.answer("🔎 Збираю стадії категорії…")
     try:
         text = await render_category_stages_table(cat_id)
@@ -302,16 +309,6 @@ async def cmd_cat_stages(m: Message):
     except Exception as e:
         log.exception("cat_stages failed")
         await m.answer(f"❗️Помилка завантаження стадій: {html.escape(str(e))}")
-
-# ------------------------ Manual command -----------------
-@dp.message(Command("report_now"))
-async def report_now(m: Message):
-    # /report_now [offset]
-    parts = (m.text or "").split()
-    offset = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
-    await m.answer("🔄 Формую сумарний звіт…")
-    await send_company_summary(offset)
-    await m.answer("✅ Готово")
 
 # ------------------------ Scheduler ----------------------
 def _next_run_dt(now_utc: datetime) -> datetime:
@@ -330,7 +327,7 @@ async def scheduler_loop():
             sleep_sec = max(1, (nxt - now_utc).total_seconds())
             log.info("[scheduler] next run at %s in %ss", nxt.isoformat(), int(sleep_sec))
             await asyncio.sleep(sleep_sec)
-            log.info("[scheduler] tick -> sending company summary")
+            log.info("[scheduler] tick -> sending summary")
             await send_company_summary(0)
         except Exception:
             log.exception("[scheduler] loop error")
@@ -342,7 +339,8 @@ async def on_startup():
     global HTTP
     HTTP = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
     await bot.set_my_commands([
-        BotCommand(command="report_now", description="Сумарний звіт (/report_now [offset])"),
+        BotCommand(command="report_now", description="Ручний запуск сумарного звіту (/report_now [offset])"),
+        BotCommand(command="cat_stages", description="Показати стадії категорії (/cat_stages [id])"),
     ])
     url = f"{WEBHOOK_BASE}/webhook/{WEBHOOK_SECRET}"
     await bot.set_webhook(url)
