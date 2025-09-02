@@ -92,7 +92,19 @@ def _is_connection(type_id: str, type_name: Optional[str] = None) -> bool:
         name = (_DEAL_TYPE_MAP.get(type_id, "") or "").strip().lower()
     return name in ("підключення", "подключение") or ("підключ" in name) or ("подключ" in name)
 
+# бригадні стадії (Кат.20) і опції виконання (UF)
 _BRIGADE_STAGE = {1: "UC_XF8O6V", 2: "UC_0XLPCN", 3: "UC_204CP3", 4: "UC_TNEW3Z", 5: "UC_RMBZ37"}
+_BRIGADE_EXEC_OPTION_ID = {1: 5494, 2: 5496, 3: 5498, 4: 5500, 5: 5502}
+_BRIGADE_EXEC_SET = set(_BRIGADE_EXEC_OPTION_ID.values())
+
+def _extract_exec_vals(uf_val) -> set:
+    """Допоміжне: привести UF_CRM_1611995532420 у множину int."""
+    try:
+        if isinstance(uf_val, list):
+            return {int(x) for x in uf_val if str(x).isdigit()}
+        return {int(uf_val)} if uf_val and str(uf_val).isdigit() else set()
+    except Exception:
+        return set()
 
 # ------------------------ Time helpers -------------------
 def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str]:
@@ -148,34 +160,43 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     label, frm, to = _day_bounds(offset_days)
     type_map = await get_deal_type_map()
 
-    # created today (cat20)
+    brigade_stage_ids = {f"C20:{v}" for v in _BRIGADE_STAGE.values()}
+
+    # created today (cat20) — тільки бригадні: стоять у бригадній колонці або мають UF опцію бригади
     created_conn = 0
     created = await b24_list(
         "crm.deal.list",
         order={"ID": "DESC"},
         filter={">=DATE_CREATE": frm, "<DATE_CREATE": to, "CATEGORY_ID": 20},
-        select=["ID", "TYPE_ID"],
+        select=["ID", "TYPE_ID", "STAGE_ID", "UF_CRM_1611995532420"],
     )
     for d in created:
         tid = d.get("TYPE_ID") or ""
-        if _is_connection(tid, type_map.get(tid)):
+        if not _is_connection(tid, type_map.get(tid)):
+            continue
+        stage_ok = str(d.get("STAGE_ID") or "") in brigade_stage_ids
+        exec_vals = _extract_exec_vals(d.get("UF_CRM_1611995532420"))
+        exec_ok = bool(exec_vals & _BRIGADE_EXEC_SET)
+        if stage_ok or exec_ok:
             created_conn += 1
 
-    # closed today (cat20 WON)
+    # closed today (cat20 WON) — тільки бригадні: перевіряємо UF опцію бригади
     closed_conn = 0
     closed = await b24_list(
         "crm.deal.list",
         order={"DATE_MODIFY": "ASC"},
         filter={"STAGE_ID": "C20:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to},
-        select=["ID", "TYPE_ID"],
+        select=["ID", "TYPE_ID", "UF_CRM_1611995532420"],
     )
     for d in closed:
         tid = d.get("TYPE_ID") or ""
-        if _is_connection(tid, type_map.get(tid)):
+        if not _is_connection(tid, type_map.get(tid)):
+            continue
+        exec_vals = _extract_exec_vals(d.get("UF_CRM_1611995532420"))
+        if exec_vals & _BRIGADE_EXEC_SET:
             closed_conn += 1
 
     # active on brigades (open in brigade stages)
-    brigade_stage_ids = {f"C20:{v}" for v in _BRIGADE_STAGE.values()}
     active_conn = 0
     open_cat20 = await b24_list(
         "crm.deal.list",
@@ -228,7 +249,6 @@ async def _safe_send(chat_id: int, text: str):
             return
         except Exception as e:
             msg = str(e)
-            # спробуємо витягнути retry_after з тексту помилки Телеги
             retry_after = None
             if "retry after " in msg.lower():
                 try:
