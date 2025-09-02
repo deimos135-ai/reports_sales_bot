@@ -1,4 +1,5 @@
-# main.py — reports-sales-bot (бригади + комбінований звіт)
+# main.py — reports-bot (бригады + “дівчат” звіт, з колонками "на конкретний день" і "думають")
+
 import asyncio
 import html
 import json
@@ -14,7 +15,6 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import BotCommand, Message, Update
-from aiogram.exceptions import TelegramRetryAfter
 from zoneinfo import ZoneInfo
 
 # ------------------------ Settings ------------------------
@@ -49,26 +49,24 @@ async def healthz():
     return {"status": "ok"}
 
 # ------------------------ Bitrix helpers ------------------
-async def _sleep_backoff(attempt: int, base: float = 0.6, cap: float = 8.0):
+async def _sleep_backoff(attempt: int, base: float = 0.5, cap: float = 8.0):
     await asyncio.sleep(min(cap, base * (2 ** attempt)))
 
 async def b24(method: str, **params) -> Any:
     url = f"{BITRIX_WEBHOOK_BASE}/{method}.json"
-    # ретраїмо на ліміти/тимчасові/внутрішні помилки
-    RETRY_ERRORS = {"QUERY_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS", "INTERNAL_SERVER_ERROR"}
-    for attempt in range(7):
+    for attempt in range(6):
         try:
             async with HTTP.post(url, json=params) as resp:
                 data = await resp.json()
                 if "error" in data:
                     err = data["error"]; desc = data.get("error_description")
-                    if err in RETRY_ERRORS:
-                        log.warning("Bitrix retryable error: %s (%s), attempt #%s", err, desc, attempt+1)
+                    if err in ("QUERY_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS"):
+                        log.warning("Bitrix rate-limit: %s (%s), retry #%s", err, desc, attempt+1)
                         await _sleep_backoff(attempt); continue
                     raise RuntimeError(f"B24 error: {err}: {desc}")
                 return data.get("result")
         except aiohttp.ClientError as e:
-            log.warning("Bitrix network error: %s, attempt #%s", e, attempt+1)
+            log.warning("Bitrix network error: %s, retry #%s", e, attempt+1)
             await _sleep_backoff(attempt)
     raise RuntimeError("Bitrix request failed after retries")
 
@@ -97,20 +95,61 @@ async def get_deal_type_map() -> Dict[str, str]:
         log.info("[cache] DEAL_TYPE: %s", len(_DEAL_TYPE_MAP))
     return _DEAL_TYPE_MAP
 
+# --- NEW: cache stages per category + helpers ---
+_CAT_STAGES: Dict[int, List[Dict[str, str]]] = {}
+
+async def get_category_stages(cat_id: int) -> List[Dict[str, str]]:
+    """
+    Стадії категорії: [{STATUS_ID, NAME}, ...]
+    """
+    global _CAT_STAGES
+    if cat_id not in _CAT_STAGES:
+        items = await b24("crm.dealcategory.stage.list", filter={"CATEGORY_ID": cat_id})
+        _CAT_STAGES[cat_id] = items or []
+        log.info("[cache] CAT%s stages: %s", cat_id, len(_CAT_STAGES[cat_id]))
+    return _CAT_STAGES[cat_id]
+
+async def find_stage_code_by_name_contains(cat_id: int, needle: str) -> Optional[str]:
+    """
+    Шукає стадію за частиною назви (без регістру); повертає код виду 'C{cat}:{STATUS_ID}'.
+    """
+    stages = await get_category_stages(cat_id)
+    n = (needle or "").strip().lower()
+    for s in stages:
+        name = (s.get("NAME") or "").strip().lower()
+        if n in name:
+            sid = s.get("STATUS_ID")
+            if sid:
+                return f"C{cat_id}:{sid}"
+    return None
+
+async def count_open_in_stage(cat_id: int, stage_code: Optional[str], type_ids: List[str]) -> int:
+    """
+    Скільки відкритих угод потрібного TYPE_ID у конкретній стадії категорії.
+    """
+    if not stage_code or not type_ids:
+        return 0
+    deals = await b24_list(
+        "crm.deal.list",
+        order={"ID": "DESC"},
+        filter={"CLOSED": "N", "CATEGORY_ID": cat_id, "STAGE_ID": stage_code, "TYPE_ID": type_ids},
+        select=["ID"],
+    )
+    return len(deals)
+
+# класифікація назв типів у наші кошики
 def normalize_type(type_name: str) -> str:
     t = (type_name or "").strip().lower()
     mapping_exact = {
         "підключення": "connection", "подключение": "connection",
         "ремонт": "repair",
-        "сервісні роботи": "service", "сервисные работы": "service",
-        "сервіс": "service", "сервис": "service",
+        "сервісні роботи": "service", "сервисные работы": "service", "сервіс": "service", "сервис": "service",
         "перепідключення": "reconnection", "переподключение": "reconnection",
         "аварія": "accident", "авария": "accident",
         "будівництво": "construction", "строительство": "construction",
         "роботи по лінії": "linework", "работы по линии": "linework",
         "звернення в кц": "cc_request", "обращение в кц": "cc_request",
-        "не выбран": "other", "не вибрано": "other",
-        "інше": "other", "прочее": "other",
+        "не выбран": "other", "не вибрано": "other", "інше": "other", "прочее": "other",
     }
     if t in mapping_exact: return mapping_exact[t]
     if any(k in t for k in ("підключ", "подключ")): return "connection"
@@ -123,14 +162,16 @@ def normalize_type(type_name: str) -> str:
     if any(k in t for k in ("кц", "контакт-центр", "колл-центр", "call")): return "cc_request"
     return "other"
 
-# “кошики” (для виводу)
+# “кошики” для основної вітрини
 BUCKETS = [
     ("connection", "📡 Підключення"),
     ("service", "🛠️ Сервіс"),
     ("reconnection", "🔄 Перепідключення"),
+    ("accident", "⚠️ Аварії"),
+    ("cc_request", "📞 Пропущені / КЦ"),
 ]
 
-# бригадні колонки (для підрахунку “Активних у колонці”)
+# бригадні колонки (щоб порахувати “Активні” сервісні)
 _BRIGADE_STAGE = {1: "UC_XF8O6V", 2: "UC_0XLPCN", 3: "UC_204CP3", 4: "UC_TNEW3Z", 5: "UC_RMBZ37"}
 _BRIGADE_EXEC_OPTION_ID = {1: 5494, 2: 5496, 3: 5498, 4: 5500, 5: 5502}
 
@@ -146,6 +187,9 @@ def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str]:
 
 # ------------------------ Helpers for buckets -------------
 async def _bucket_codes() -> Dict[str, List[str]]:
+    """
+    {bucket_key: [TYPE_ID,...]} згідно з довідником Bitrix.
+    """
     m = await get_deal_type_map()
     out: Dict[str, List[str]] = {}
     for code, name in m.items():
@@ -153,123 +197,141 @@ async def _bucket_codes() -> Dict[str, List[str]]:
         out.setdefault(cls, []).append(code)
     return out
 
-def _truthy_exec(value: Any) -> bool:
-    if value is None: return False
-    if isinstance(value, (list, tuple, set)): return len(value) > 0
-    if isinstance(value, str): return value.strip() not in ("", "0")
-    if isinstance(value, (int, float)): return int(value) != 0
-    return True
-
-async def _list_created_in_day(categories: List[int], type_ids: List[str], frm: str, to: str) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for cat in categories:
-        chunk = await b24_list(
-            "crm.deal.list",
-            order={"ID": "DESC"},
-            filter={">=DATE_CREATE": frm, "<DATE_CREATE": to, "CATEGORY_ID": cat, "TYPE_ID": type_ids},
-            select=["ID", "TYPE_ID", "STAGE_ID", "CLOSED", "UF_CRM_1611995532420"],
-        )
-        out.extend(chunk)
-    return out
-
-async def _list_closed_won_in_day(categories: List[int], type_ids: List[str], frm: str, to: str) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for cat in categories:
-        chunk = await b24_list(
-            "crm.deal.list",
-            order={"DATE_MODIFY": "ASC"},
-            filter={"STAGE_ID": f"C{cat}:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to, "TYPE_ID": type_ids},
-            select=["ID", "TYPE_ID"],
-        )
-        out.extend(chunk)
-    return out
-
-# ------------------------ Brigade daily report ------------
+# ------------------------ Brigade daily report ---------------
 async def build_daily_report(brigade: int, offset_days: int) -> Tuple[str, Dict[str, int], int]:
     label, frm, to = _day_bounds(offset_days)
     m = await get_deal_type_map()
     exec_opt = _BRIGADE_EXEC_OPTION_ID.get(brigade)
-
     filter_closed = {"STAGE_ID": "C20:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to}
     if exec_opt: filter_closed["UF_CRM_1611995532420"] = exec_opt
-
     closed = await b24_list("crm.deal.list", order={"DATE_MODIFY":"ASC"}, filter=filter_closed, select=["ID","TYPE_ID"])
 
-    counts = {"connection":0,"repair":0,"service":0,"reconnection":0}
+    counts = {"connection":0,"repair":0,"service":0,"reconnection":0,"accident":0,"construction":0,"linework":0,"cc_request":0,"other":0}
     for d in closed:
         tname = m.get(d.get("TYPE_ID") or "", "")
-        key = normalize_type(tname)
-        if key in counts: counts[key] = counts.get(key,0)+1
+        cls = normalize_type(tname)
+        counts[cls] = counts.get(cls,0)+1
 
     stage_code = _BRIGADE_STAGE[brigade]
-    active = await b24_list("crm.deal.list", order={"ID":"DESC"},
-                            filter={"CLOSED":"N","STAGE_ID":f"C20:{stage_code}"}, select=["ID"])
+    active = await b24_list("crm.deal.list", order={"ID":"DESC"}, filter={"CLOSED":"N","STAGE_ID":f"C20:{stage_code}"}, select=["ID"])
     return label, counts, len(active)
 
 def format_brigade_report(brigade: int, date_label: str, counts: Dict[str, int], active_left: int) -> str:
-    total = sum(counts.get(k,0) for k,_ in BUCKETS)
+    total = counts.get("connection",0) + counts.get("service",0) + counts.get("reconnection",0)
     return "\n".join([
         f"🧑‍🔧 <b>Бригада №{brigade} — {date_label}</b>",
         "",
         f"✅ <b>Закрито задач:</b> {total}",
-        f"🛰 Підключення — {counts.get('connection',0)} | 🛠 Сервіс — {counts.get('service',0)} | 🔁 Перепідключення — {counts.get('reconnection',0)}",
+        f"🛰 Підключення — {counts.get('connection',0)} | 🔧 Сервіс — {counts.get('service',0)} | 🔁 Перепідключення — {counts.get('reconnection',0)}",
         "",
         f"📌 <b>Активних задач у колонці бригади:</b> {active_left}",
     ])
 
-# ------------------------ Company summary -----------------
+# ------------------------ Company summary (“дівчат” звіт) ------------------
 async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
+    """
+    Комбінований звіт:
+      * Підключення (кат.0): створені/закриті за добу + відкриті у стадіях "на конкретний день" і "думають"
+      * Сервіс (кат.20): створені/закриті за добу + відкриті, активні (бригадні), сервісні виїзди
+      * Перепідключення: закрито за добу
+      * Пропущені: створені за добу (тип cc_request)
+      * Аварії: закрито/створено за добу
+    """
     label, frm, to = _day_bounds(offset_days)
     codes = await _bucket_codes()
 
-    t_connection = codes.get("connection", [])
-    t_service    = codes.get("service", [])
-    t_reconnect  = codes.get("reconnection", [])
-    t_cc         = codes.get("cc_request", [])
-    t_accident   = codes.get("accident", [])
+    # ---------- ПІДКЛЮЧЕННЯ (CATEGORY_ID = 0) ----------
+    created_conn = await b24_list(
+        "crm.deal.list",
+        order={"ID":"DESC"},
+        filter={">=DATE_CREATE": frm, "<DATE_CREATE": to, "CATEGORY_ID": 0, "TYPE_ID": codes.get("connection", [])},
+        select=["ID"],
+    )
+    closed_conn = await b24_list(
+        "crm.deal.list",
+        order={"DATE_MODIFY":"ASC"},
+        filter={"STAGE_ID":"C0:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to, "TYPE_ID": codes.get("connection", [])},
+        select=["ID"],
+    )
 
-    CAT_CONN = [0]   # Підключення
-    CAT_SRV  = [20]  # Сервіс
-    CAT_RECO = [20]  # Перепідключення теж у 20
+    # відкриті підключення у стадіях "на конкретний день" та "думають"
+    stage_specific_day = await find_stage_code_by_name_contains(0, "на конкретний день")
+    stage_thinking = await find_stage_code_by_name_contains(0, "думають")
+    conn_specific_day_open = await count_open_in_stage(0, stage_specific_day, codes.get("connection", []))
+    conn_thinking_open = await count_open_in_stage(0, stage_thinking, codes.get("connection", []))
 
-    # створені за добу
-    created_conn = await _list_created_in_day(CAT_CONN, t_connection, frm, to)
-    created_srv  = await _list_created_in_day(CAT_SRV,  t_service,    frm, to)
-    created_reco = await _list_created_in_day(CAT_RECO, t_reconnect,  frm, to)
-    created_cc   = await _list_created_in_day(CAT_SRV,  t_cc,         frm, to)   # “пропущені” ведемо у 20
-    created_acc  = await _list_created_in_day(CAT_SRV,  t_accident,   frm, to)
-
-    # закриті (WON) за добу
-    closed_conn = await _list_closed_won_in_day(CAT_CONN, t_connection, frm, to)
-    closed_srv  = await _list_closed_won_in_day(CAT_SRV,  t_service,    frm, to)
-    closed_reco = await _list_closed_won_in_day(CAT_RECO, t_reconnect,  frm, to)
-    closed_acc  = await _list_closed_won_in_day(CAT_SRV,  t_accident,   frm, to)
-
-    # відкриті сервісні — для блоків “Не закритих/Активних/Сервісний виїзд”
+    # ---------- СЕРВІС (CATEGORY_ID = 20) ----------
+    created_serv = await b24_list(
+        "crm.deal.list",
+        order={"ID":"DESC"},
+        filter={">=DATE_CREATE": frm, "<DATE_CREATE": to, "CATEGORY_ID": 20, "TYPE_ID": codes.get("service", [])},
+        select=["ID"],
+    )
+    closed_serv = await b24_list(
+        "crm.deal.list",
+        order={"DATE_MODIFY":"ASC"},
+        filter={"STAGE_ID":"C20:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to, "TYPE_ID": codes.get("service", [])},
+        select=["ID"],
+    )
     open_service = await b24_list(
         "crm.deal.list",
-        order={"ID": "DESC"},
-        filter={"CLOSED": "N", "CATEGORY_ID": 20, "TYPE_ID": t_service},
-        select=["ID", "STAGE_ID", "UF_CRM_1611995532420"],
+        order={"ID":"DESC"},
+        filter={"CLOSED":"N","CATEGORY_ID":20, "TYPE_ID": codes.get("service", [])},
+        select=["ID","STAGE_ID","UF_CRM_1611995532420"],
     )
     brigade_stage_ids = {f"C20:{v}" for v in _BRIGADE_STAGE.values()}
     service_open_total = len(open_service)
-    service_active     = sum(1 for d in open_service if str(d.get("STAGE_ID") or "") in brigade_stage_ids)
-    service_trips      = sum(1 for d in open_service if _truthy_exec(d.get("UF_CRM_1611995532420")))
+    service_active = sum(1 for d in open_service if (str(d.get("STAGE_ID") or "") in brigade_stage_ids))
+    service_trips = sum(1 for d in open_service if (d.get("UF_CRM_1611995532420") or []))
+
+    # ---------- Перепідключення (закрито за добу, кат.20) ----------
+    closed_reconn = await b24_list(
+        "crm.deal.list",
+        order={"DATE_MODIFY":"ASC"},
+        filter={"STAGE_ID":"C20:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to, "TYPE_ID": codes.get("reconnection", [])},
+        select=["ID"],
+    )
+
+    # ---------- Пропущені / КЦ (створені) ----------
+    created_cc = await b24_list(
+        "crm.deal.list",
+        order={"ID":"DESC"},
+        filter={">=DATE_CREATE": frm, "<DATE_CREATE": to, "CATEGORY_ID": 20, "TYPE_ID": codes.get("cc_request", [])},
+        select=["ID"],
+    )
+
+    # ---------- Аварії (створені/закриті) ----------
+    created_acc = await b24_list(
+        "crm.deal.list",
+        order={"ID":"DESC"},
+        filter={">=DATE_CREATE": frm, "<DATE_CREATE": to, "CATEGORY_ID": 20, "TYPE_ID": codes.get("accident", [])},
+        select=["ID"],
+    )
+    closed_acc = await b24_list(
+        "crm.deal.list",
+        order={"DATE_MODIFY":"ASC"},
+        filter={"STAGE_ID":"C20:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to, "TYPE_ID": codes.get("accident", [])},
+        select=["ID"],
+    )
 
     return {
         "date_label": label,
-        "connections": {"created": len(created_conn), "closed": len(closed_conn)},
+        "connections": {
+            "created": len(created_conn),
+            "closed": len(closed_conn),
+            "specific_day_open": conn_specific_day_open,
+            "thinking_open": conn_thinking_open,
+        },
         "service": {
-            "created": len(created_srv),
-            "closed": len(closed_srv),
+            "created": len(created_serv),
+            "closed": len(closed_serv),
             "open_total": service_open_total,
             "active": service_active,
             "service_trips": service_trips,
-            "moved": 0,
-            "overdue": 0,
+            "moved": 0,      # немає стабільного критерію — залишаємо 0
+            "overdue": 0,    # потребує чіткої дати-дедлайну — залишаємо 0
         },
-        "reconnections": {"created": len(created_reco), "closed": len(closed_reco)},
+        "reconnections": {"closed": len(closed_reconn)},
         "cc_requests": len(created_cc),
         "accidents": {"created": len(created_acc), "closed": len(closed_acc)},
     }
@@ -285,6 +347,8 @@ def format_company_summary(d: Dict[str, Any]) -> str:
         "📌 <b>Підключення</b>",
         f"Всього подали — <b>{c['created']}</b>",
         f"Закрили — <b>{c['closed']}</b>",
+        f"На конкретний день — <b>{c['specific_day_open']}</b>",
+        f"Думають — <b>{c['thinking_open']}</b>",
         "",
         "📌 <b>Сервіс</b>",
         f"Подали — <b>{s['created']}</b>",
@@ -297,7 +361,6 @@ def format_company_summary(d: Dict[str, Any]) -> str:
         f"Протермінованих — <b>{s['overdue']}</b>",
         "",
         "📌 <b>Перепідключення</b>",
-        f"Подали — <b>{r['created']}</b>",
         f"Закрили — <b>{r['closed']}</b>",
         "",
         f"📞 Пропущені — <b>{cc}</b>",
@@ -307,14 +370,10 @@ def format_company_summary(d: Dict[str, Any]) -> str:
 
 # ------------------------ Send helpers -------------------
 async def _safe_send(chat_id: int, text: str):
-    for attempt in range(6):
+    for attempt in range(5):
         try:
             await bot.send_message(chat_id, text, disable_web_page_preview=True)
             return
-        except TelegramRetryAfter as e:
-            wait = max(1, int(getattr(e, "retry_after", 5)))
-            log.warning("TG flood control: retry after %ss (attempt %s)", wait, attempt+1)
-            await asyncio.sleep(wait)
         except Exception as e:
             log.warning("telegram send failed: %s, retry #%s", e, attempt+1)
             await _sleep_backoff(attempt)
@@ -322,7 +381,7 @@ async def _safe_send(chat_id: int, text: str):
 
 def _resolve_chat_for_brigade(b: int) -> Optional[int]:
     if str(b) in REPORT_CHATS: return int(REPORT_CHATS[str(b)])
-    if b in REPORT_CHATS: return int(REPORT_CHATS[b])  # якщо JSON передали числами
+    if b in REPORT_CHATS: return int(REPORT_CHATS[b])
     if "all" in REPORT_CHATS: return int(REPORT_CHATS["all"])
     return None
 
@@ -351,9 +410,9 @@ async def send_company_summary(offset_days: int = 0) -> None:
     try:
         data = await build_company_summary(offset_days)
         await _safe_send(chat_id, format_company_summary(data))
-    except Exception as e:
+    except Exception:
         log.exception("company summary failed")
-        await _safe_send(chat_id, f"❗️Помилка формування комбінованого звіту: {html.escape(str(e))[:150]}")
+        await _safe_send(chat_id, "❗️Помилка формування комбінованого звіту")
 
 # ------------------------ Manual command -----------------
 @dp.message(Command("report_now"))
