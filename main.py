@@ -1,4 +1,4 @@
-# main.py — reports-bot (бригады + комбінований “Підключення”)
+# main.py — reports-bot (тільки сумарний звіт по Підключеннях)
 import asyncio
 import html
 import json
@@ -99,13 +99,9 @@ def normalize_type(type_name: str) -> str:
     return "other"
 
 async def get_type_ids(bucket: str) -> List[str]:
-    """return list of TYPE_ID codes for a bucket ('connection')"""
+    """список TYPE_ID для кошика ('connection')."""
     m = await get_deal_type_map()
-    ids = []
-    for code, name in m.items():
-        if normalize_type(name) == bucket:
-            ids.append(code)
-    return ids
+    return [code for code, name in m.items() if normalize_type(name) == bucket]
 
 # --- cache stages per category + helpers ---
 _CAT_STAGES: Dict[int, List[Dict[str, str]]] = {}
@@ -129,18 +125,18 @@ async def find_stage_code_by_name_contains(cat_id: int, needle: str) -> Optional
                 return f"C{cat_id}:{sid}"
     return None
 
-async def count_open_in_stage(cat_id: int, stage_code: Optional[str], type_ids: List[str]) -> int:
-    if not stage_code or not type_ids: return 0
-    deals = await b24_list(
-        "crm.deal.list",
-        order={"ID": "DESC"},
-        filter={"CLOSED": "N", "CATEGORY_ID": cat_id, "STAGE_ID": stage_code, "TYPE_ID": type_ids},
-        select=["ID"],
-    )
+async def count_open_in_stage(cat_id: int, stage_code: Optional[str], *, type_ids: Optional[List[str]]) -> int:
+    """
+    Рахує відкриті угоди у конкретній стадії.
+    Якщо type_ids=None — НЕ фільтруємо по TYPE_ID (використовуємо для категорії 0).
+    """
+    if not stage_code:
+        return 0
+    flt: Dict[str, Any] = {"CLOSED": "N", "CATEGORY_ID": cat_id, "STAGE_ID": stage_code}
+    if type_ids is not None and len(type_ids) > 0:
+        flt["TYPE_ID"] = type_ids
+    deals = await b24_list("crm.deal.list", order={"ID": "DESC"}, filter=flt, select=["ID"])
     return len(deals)
-
-# ------------------------ Brigade mapping -----------------
-_BRIGADE_STAGE = {1: "UC_XF8O6V", 2: "UC_0XLPCN", 3: "UC_204CP3", 4: "UC_TNEW3Z", 5: "UC_RMBZ37"}
 
 # ------------------------ Time helpers -------------------
 def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str]:
@@ -152,39 +148,6 @@ def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str]:
     label = start_local.strftime("%d.%m.%Y")
     return label, start_utc.isoformat(), end_utc.isoformat()
 
-# ------------------------ Brigade daily report (як було) ---------------
-async def build_daily_report(brigade: int, offset_days: int) -> Tuple[str, Dict[str, int], int]:
-    label, frm, to = _day_bounds(offset_days)
-    type_conn = await get_type_ids("connection")
-
-    # закриті за добу по конкретній бригаді (через exec-option це робили раніше; зараз рахуємо просто TYPE_ID + WON)
-    closed = await b24_list(
-        "crm.deal.list",
-        order={"DATE_MODIFY": "ASC"},
-        filter={"STAGE_ID": "C20:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to, "TYPE_ID": type_conn},
-        select=["ID"],
-    )
-    counts = {"connection": len(closed), "service": 0, "reconnection": 0}
-
-    # активні в колонці бригади
-    stage_code = _BRIGADE_STAGE[brigade]
-    active = await b24_list(
-        "crm.deal.list",
-        order={"ID": "DESC"},
-        filter={"CLOSED": "N", "STAGE_ID": f"C20:{stage_code}", "TYPE_ID": type_conn},
-        select=["ID"],
-    )
-    return label, counts, len(active)
-
-def format_brigade_report(brigade: int, date_label: str, counts: Dict[str, int], active_left: int) -> str:
-    return "\n".join([
-        f"🧑‍🔧 <b>Бригада №{brigade} — {date_label}</b>",
-        "",
-        f"✅ <b>Закрито підключень:</b> {counts.get('connection',0)}",
-        "",
-        f"📌 <b>Активних задач у колонці бригади:</b> {active_left}",
-    ])
-
 # ------------------------ Company summary (ПІДКЛЮЧЕННЯ) ---------------
 async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     """
@@ -192,8 +155,8 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
       • подані сьогодні (cat=20, DATE_CREATE)
       • закриті сьогодні (cat=20, STAGE=WON, DATE_MODIFY)
       • активні на бригадах (cat=20, відкриті, STAGE ∈ бригадних)
-      • на конкретний день (cat=0, відкриті, стадія за назвою)
-      • думають (cat=0, відкриті, стадія за назвою)
+      • на конкретний день (cat=0, відкриті, стадія — без фільтру TYPE_ID)
+      • думають (cat=0, відкриті, стадія — без фільтру TYPE_ID)
     """
     label, frm, to = _day_bounds(offset_days)
     type_conn = await get_type_ids("connection")
@@ -221,14 +184,16 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
         filter={"CLOSED":"N","CATEGORY_ID":20, "TYPE_ID": type_conn},
         select=["ID","STAGE_ID"],
     )
-    brigade_stage_ids = {f"C20:{v}" for v in _BRIGADE_STAGE.values()}
+    # якщо колонки бригад названі через кастомні коди — впишіть тут
+    BRIGADE_STAGE_CODES = {"UC_XF8O6V","UC_0XLPCN","UC_204CP3","UC_TNEW3Z","UC_RMBZ37"}
+    brigade_stage_ids = {f"C20:{v}" for v in BRIGADE_STAGE_CODES}
     active_brigades = sum(1 for d in open_conn_cat20 if (str(d.get("STAGE_ID") or "") in brigade_stage_ids))
 
-    # --- cat=0: "на конкретний день" та "думають"
+    # --- cat=0: "на конкретний день" та "думають" (без TYPE_ID!)
     stage_specific_day = await find_stage_code_by_name_contains(0, "конкретн")
     stage_thinking     = await find_stage_code_by_name_contains(0, "дума")
-    cnt_specific_day = await count_open_in_stage(0, stage_specific_day, type_conn)
-    cnt_thinking      = await count_open_in_stage(0, stage_thinking, type_conn)
+    cnt_specific_day = await count_open_in_stage(0, stage_specific_day, type_ids=None)
+    cnt_thinking      = await count_open_in_stage(0, stage_thinking,     type_ids=None)
 
     return {
         "date_label": label,
@@ -245,7 +210,7 @@ def format_company_summary(d: Dict[str, Any]) -> str:
     dl = d["date_label"]
     c = d["connections"]
     lines = [
-        f"<b>📆 Дата: {dl}</b>",
+        f"📅 <b>Дата: {dl}</b>",
         "",
         "📌 <b>Підключення</b>",
         f"Всього подали (кат.20) — <b>{c['created_cat20']}</b>",
@@ -268,28 +233,10 @@ async def _safe_send(chat_id: int, text: str):
             await _sleep_backoff(attempt)
     log.error("telegram send failed permanently")
 
-def _resolve_chat_for_brigade(b: int) -> Optional[int]:
-    if str(b) in REPORT_CHATS: return int(REPORT_CHATS[str(b)])
-    if b in REPORT_CHATS: return int(REPORT_CHATS[b])
-    if "all" in REPORT_CHATS: return int(REPORT_CHATS["all"])
-    return None
-
 def _resolve_summary_chat() -> Optional[int]:
     if REPORT_SUMMARY_CHAT: return REPORT_SUMMARY_CHAT
     if "all" in REPORT_CHATS: return int(REPORT_CHATS["all"])
     return None
-
-async def send_all_brigades_report(offset_days: int = 0) -> None:
-    tasks = []
-    for b in (1,2,3,4,5):
-        chat_id = _resolve_chat_for_brigade(b)
-        if not chat_id:
-            log.warning("No chat configured for brigade %s", b); continue
-        async def run(b_=b, chat_=chat_id):
-            label, counts, left = await build_daily_report(b_, offset_days)
-            await _safe_send(chat_, format_brigade_report(b_, label, counts, left))
-        tasks.append(run())
-    if tasks: await asyncio.gather(*tasks, return_exceptions=True)
 
 async def send_company_summary(offset_days: int = 0) -> None:
     chat_id = _resolve_summary_chat()
@@ -306,23 +253,11 @@ async def send_company_summary(offset_days: int = 0) -> None:
 # ------------------------ Manual command -----------------
 @dp.message(Command("report_now"))
 async def report_now(m: Message):
-    """
-    /report_now            — бригадні звіти + комбінований
-    /report_now 1          — за вчора
-    /report_now summary    — тільки комбінований за сьогодні
-    /report_now summary 1  — тільки комбінований за вчора
-    """
+    # /report_now [offset]
     parts = (m.text or "").split()
-    if len(parts) >= 2 and parts[1].lower() == "summary":
-        offset = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 0
-        await m.answer("🔄 Формую звіт по підключеннях…")
-        await send_company_summary(offset)
-        await m.answer("✅ Готово")
-        return
-
     offset = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
-    await m.answer("🔄 Формую звіти…")
-    await asyncio.gather(send_all_brigades_report(offset), send_company_summary(offset))
+    await m.answer("🔄 Формую сумарний звіт…")
+    await send_company_summary(offset)
     await m.answer("✅ Готово")
 
 # ------------------------ Scheduler ----------------------
@@ -342,8 +277,8 @@ async def scheduler_loop():
             sleep_sec = max(1, (nxt - now_utc).total_seconds())
             log.info("[scheduler] next run at %s in %ss", nxt.isoformat(), int(sleep_sec))
             await asyncio.sleep(sleep_sec)
-            log.info("[scheduler] tick -> sending daily (brigades + summary)")
-            await asyncio.gather(send_all_brigades_report(0), send_company_summary(0))
+            log.info("[scheduler] tick -> sending company summary")
+            await send_company_summary(0)
         except Exception:
             log.exception("[scheduler] loop error")
             await asyncio.sleep(5)
@@ -354,7 +289,7 @@ async def on_startup():
     global HTTP
     HTTP = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
     await bot.set_my_commands([
-        BotCommand(command="report_now", description="Ручний запуск звітів (/report_now [summary] [offset])"),
+        BotCommand(command="report_now", description="Сумарний звіт (/report_now [offset])"),
     ])
     url = f"{WEBHOOK_BASE}/webhook/{WEBHOOK_SECRET}"
     await bot.set_webhook(url)
