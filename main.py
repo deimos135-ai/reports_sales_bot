@@ -255,8 +255,8 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     )
 
     # відкриті підключення у стадіях "на конкретний день" та "думають"
-    stage_specific_day = await find_stage_code_by_name_contains(0, "на конкретний день")
-    stage_thinking = await find_stage_code_by_name_contains(0, "думають")
+    stage_specific_day = await find_stage_code_by_name_contains(0, "На конкретний день")
+    stage_thinking = await find_stage_code_by_name_contains(0, "Думають")
     conn_specific_day_open = await count_open_in_stage(0, stage_specific_day, codes.get("connection", []))
     conn_thinking_open = await count_open_in_stage(0, stage_thinking, codes.get("connection", []))
 
