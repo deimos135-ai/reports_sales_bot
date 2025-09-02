@@ -249,6 +249,59 @@ async def send_company_summary(offset_days: int = 0) -> None:
     except Exception:
         log.exception("company summary failed")
         await _safe_send(chat_id, "❗️Помилка формування комбінованого звіту")
+    
+# ---- ADD: pretty table for category stages ---------------------------------
+def _pad(s: str, n: int) -> str:
+    s = str(s or "")
+    return s + " " * max(0, n - len(s))
+
+async def render_category_stages_table(cat_id: int) -> str:
+    """
+    Повертає текст з таблицею стадій для категорії cat_id:
+    колонки: STATUS_ID, NAME
+    """
+    stages = await get_category_stages(cat_id)
+    rows = [(s.get("STATUS_ID", ""), s.get("NAME", "")) for s in stages]
+
+    # розміри колонок
+    w_id = max([len("STATUS_ID")] + [len(x[0]) for x in rows]) + 2
+    w_nm = max([len("NAME")] + [len(x[1]) for x in rows]) + 2
+
+    # збираємо таблицю у code-block
+    out = []
+    out.append(f"Категорія: {cat_id}\n")
+    out.append("<code>")
+    out.append(_pad("STATUS_ID", w_id) + _pad("NAME", w_nm))
+    out.append(_pad("-" * len("STATUS_ID"), w_id) + _pad("-" * len("NAME"), w_nm))
+    for sid, name in rows:
+        out.append(_pad(sid, w_id) + _pad(name, w_nm))
+    out.append("</code>")
+    out.append(
+        "\nПорада: знайди тут точні назви колонок для "
+        "«На конкретний день» та «Думають» і впиши їх у match-логіку."
+    )
+    return "\n".join(out)
+
+# ---- ADD: command handler to print stages -----------------------------------
+@dp.message(Command("cat_stages"))
+async def cmd_cat_stages(m: Message):
+    """
+    /cat_stages          -> покаже стадії категорії 0
+    /cat_stages 20       -> покаже стадії категорії 20
+    """
+    parts = (m.text or "").split()
+    try:
+        cat_id = int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        cat_id = 0
+
+    await m.answer("🔎 Збираю стадії категорії…")
+    try:
+        text = await render_category_stages_table(cat_id)
+        await m.answer(text)
+    except Exception as e:
+        log.exception("cat_stages failed")
+        await m.answer(f"❗️Помилка завантаження стадій: {html.escape(str(e))}")
 
 # ------------------------ Manual command -----------------
 @dp.message(Command("report_now"))
