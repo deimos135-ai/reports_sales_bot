@@ -194,7 +194,7 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     closed = await b24_list(
         "crm.deal.list",
         order={"DATE_MODIFY": "ASC"},
-        filter={"CATEGORY_ID": 20, "STAGE_ID": "C20:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to},
+        filter={"CATEGORY_ID": 20, "STAGE_ID": "C20:WON", ">=CLOSEDATE": frm, "<CLOSEDATE": to},
         select=["ID", "TYPE_ID"],
     )
     for d in closed:
