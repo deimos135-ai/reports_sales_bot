@@ -1,4 +1,4 @@
-# main.py — Fiber Reports (summary-only, fixed CLOSEDATE & "submitted today" logic)
+# main.py — Fiber Reports (summary-only, strict "Підключення")
 import asyncio, html, json, logging, os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -86,23 +86,18 @@ async def get_deal_type_map() -> Dict[str, str]:
         log.info("[cache] DEAL_TYPE: %s", len(_DEAL_TYPE_MAP))
     return _DEAL_TYPE_MAP
 
-def _is_connection(type_id: str, type_name: Optional[str] = None) -> bool:
-    name = (type_name or "").strip().lower()
-    if not name and _DEAL_TYPE_MAP:
-        name = (_DEAL_TYPE_MAP.get(type_id, "") or "").strip().lower()
-    return (
-        name in ("підключення", "подключение")
-        or ("підключ" in name)
-        or ("подключ" in name)
-    )
-
-async def _connection_type_ids() -> List[str]:
-    m = await get_deal_type_map()
-    return [tid for tid, nm in m.items() if _is_connection(tid, nm)]
-
-# Бригадні стадії в кат.20
-_BRIGADE_STAGE = {1: "UC_XF8O6V", 2: "UC_0XLPCN", 3: "UC_204CP3", 4: "UC_TNEW3Z", 5: "UC_RMBZ37"}
-_BRIGADE_STAGE_FULL = {f"C20:{v}" for v in _BRIGADE_STAGE.values()}
+async def get_connection_type_ids_strict() -> List[str]:
+    """
+    Повертає список TYPE_ID, де назва ТІЛЬКИ рівно "Підключення" або "Подключение".
+    Будь-які схожі назви ігноруємо — це прибирає «роздування» лічильників.
+    """
+    mp = await get_deal_type_map()
+    out: List[str] = []
+    for code, name in mp.items():
+        n = (name or "").strip().lower()
+        if n in ("підключення", "подключение"):
+            out.append(code)
+    return out
 
 # ------------------------ Time helpers -------------------
 def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str]:
@@ -125,96 +120,114 @@ async def _cat0_stages() -> Dict[str, str]:
     return _CAT0_STAGES
 
 async def _resolve_cat0_stage_ids() -> Tuple[str, str]:
+    """
+    Повертаємо повні коди типу "C0:5" для:
+      - "На конкретний день"
+      - "Думають"
+    Маємо фолбеки на випадок порожнього довідника.
+    """
     st = await _cat0_stages()
     exact_id = None; think_id = None
     for sid, nm in st.items():
         n = (nm or "").strip().lower()
         if n == "на конкретний день": exact_id = sid
         if n == "думають": think_id = sid
-    if not exact_id: exact_id = "5"         # fallback
-    if not think_id: think_id = "DETAILS"   # fallback
+    if not exact_id: exact_id = "5"         # fallback з твого дампу
+    if not think_id: think_id = "DETAILS"   # fallback з твого дампу
     return f"C0:{exact_id}", f"C0:{think_id}"
 
-async def _count_open_in_stage(cat_id: int, stage_full: str, type_ids: Optional[List[str]] = None) -> int:
-    flt: Dict[str, Any] = {"CLOSED": "N", "CATEGORY_ID": cat_id, "STAGE_ID": stage_full}
-    if type_ids: flt["TYPE_ID"] = type_ids
-    deals = await b24_list("crm.deal.list", order={"ID": "DESC"}, filter=flt, select=["ID"])
+async def _count_open_in_stage(cat_id: int, stage_full: str) -> int:
+    deals = await b24_list(
+        "crm.deal.list",
+        order={"ID": "DESC"},
+        filter={"CLOSED": "N", "CATEGORY_ID": cat_id, "STAGE_ID": stage_full},
+        select=["ID"],
+    )
     if deals: return len(deals)
-    # fallback: короткий STAGE_ID
+    # fallback: короткий STAGE_ID (на випадок різних форматів)
     short = stage_full.split(":", 1)[-1]
-    flt["STAGE_ID"] = short
-    deals_fb = await b24_list("crm.deal.list", order={"ID": "DESC"}, filter=flt, select=["ID"])
+    deals_fb = await b24_list(
+        "crm.deal.list",
+        order={"ID": "DESC"},
+        filter={"CLOSED": "N", "CATEGORY_ID": cat_id, "STAGE_ID": short},
+        select=["ID"],
+    )
     return len(deals_fb)
 
 # ------------------------ Summary builder -----------------
 async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     label, frm, to = _day_bounds(offset_days)
-    type_map = await get_deal_type_map()
-    conn_type_ids = await _connection_type_ids()
 
-    # A) "🆕 Подали сьогодні":
-    #   A1: кат.0, стадія "На конкретний день", TYPE=Підключення, DATE_CREATE у діапазоні
-    c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
-    created_c0_exact = await b24_list(
+    # строгий перелік TYPE_ID для "Підключення"
+    conn_type_ids = await get_connection_type_ids_strict()
+
+    # ---- Created today ----
+    # (1) кат.20, TYPE=Підключення, створені сьогодні
+    created_conn_cat20 = await b24_list(
+        "crm.deal.list",
+        order={"ID": "DESC"},
+        filter={
+            "CATEGORY_ID": 20,
+            "TYPE_ID": conn_type_ids,
+            ">=DATE_CREATE": frm,
+            "<DATE_CREATE": to,
+        },
+        select=["ID"],
+    )
+    # (2) кат.0, TYPE=Підключення, стадія "На конкретний день", створені сьогодні
+    c0_exact_stage, _c0_think_stage = await _resolve_cat0_stage_ids()
+    created_conn_cat0_exact = await b24_list(
         "crm.deal.list",
         order={"ID": "DESC"},
         filter={
             "CATEGORY_ID": 0,
-            "STAGE_ID": c0_exact_stage,
             "TYPE_ID": conn_type_ids,
-            ">=DATE_CREATE": frm, "<DATE_CREATE": to,
+            "STAGE_ID": c0_exact_stage,
+            ">=DATE_CREATE": frm,
+            "<DATE_CREATE": to,
         },
-        select=["ID"]
+        select=["ID"],
     )
-    #   A2: кат.20, переміщені у будь-яку бригадну стадію сьогодні (DATE_MODIFY),
-    #       TYPE=Підключення
-    created_to_brigades = await b24_list(
+    created_ids = {int(d["ID"]) for d in created_conn_cat20} | {int(d["ID"]) for d in created_conn_cat0_exact}
+    created_conn = len(created_ids)
+
+    # ---- Closed today (WON) ----
+    closed_conn_rows = await b24_list(
         "crm.deal.list",
         order={"DATE_MODIFY": "ASC"},
         filter={
             "CATEGORY_ID": 20,
-            "STAGE_ID": list(_BRIGADE_STAGE_FULL),  # масив значень ок
             "TYPE_ID": conn_type_ids,
-            ">=DATE_MODIFY": frm, "<DATE_MODIFY": to,
-        },
-        select=["ID"]
-    )
-    created_conn = len(created_c0_exact) + len(created_to_brigades)
-
-    # B) "✅ Закрили сьогодні" — рахуємо по CLOSEDATE, тільки підключення у кат.20, стадія WON
-    closed_list = await b24_list(
-        "crm.deal.list",
-        order={"CLOSEDATE": "ASC"},
-        filter={
-            "CATEGORY_ID": 20,
             "STAGE_ID": "C20:WON",
-            "TYPE_ID": conn_type_ids,
-            ">=CLOSEDATE": frm, "<CLOSEDATE": to,
+            ">=DATE_MODIFY": frm,
+            "<DATE_MODIFY": to,
         },
-        select=["ID"]
+        select=["ID"],
     )
-    closed_conn = len(closed_list)
+    closed_conn = len(closed_conn_rows)
 
-    # C) "📊 Активні на бригадах" — відкриті у бригадних, тип=Підключення
+    # ---- Active in work (semantic=P) ----
     active_open = await b24_list(
         "crm.deal.list",
         order={"ID": "DESC"},
         filter={
-            "CLOSED": "N",
             "CATEGORY_ID": 20,
-            "STAGE_SEMANTIC_ID": "P",
             "TYPE_ID": conn_type_ids,
+            "CLOSED": "N",
+            "STAGE_SEMANTIC_ID": "P",  # = "Сделка в работе"
         },
-        select=["ID"]
+        select=["ID"],
     )
     active_conn = len(active_open)
-    
-    # D) Категорія 0: відкриті у "На конкретний день" та "Думають"
-    exact_cnt = await _count_open_in_stage(0, c0_exact_stage, conn_type_ids)
-    think_cnt = await _count_open_in_stage(0, c0_think_stage, conn_type_ids)
 
-    log.info("[summary] created(today)=%s (c0_exact=%s + to_brigades=%s), closed=%s, active=%s, exact=%s, think=%s",
-             created_conn, len(created_c0_exact), len(created_to_brigades), closed_conn, active_conn, exact_cnt, think_cnt)
+    # ---- CAT0 counters (open, regardless of date) ----
+    exact_cnt = await _count_open_in_stage(0, c0_exact_stage)
+    think_cnt = await _count_open_in_stage(0, _c0_think_stage)
+
+    log.info(
+        "[summary] created=%s, closed=%s, active=%s, exact=%s, think=%s",
+        created_conn, closed_conn, active_conn, exact_cnt, think_cnt
+    )
 
     return {
         "date_label": label,
@@ -285,7 +298,7 @@ async def report_now(m: Message):
         offset = int(parts[1])
 
     await m.answer("🔄 Формую сумарний звіт…")
-    # 1) завжди відповідаємо в той чат, де команда
+    # 1) відповідаємо в той чат, де команда
     await send_company_summary_to_chat(m.chat.id, offset)
     # 2) додатково — у службовий чат, якщо налаштований і він інший
     if REPORT_SUMMARY_CHAT and REPORT_SUMMARY_CHAT != m.chat.id:
