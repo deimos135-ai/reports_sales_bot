@@ -166,14 +166,24 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     )
     created_total = len(created_cat0_exact) + len(moved_cat20_to_brigade)
 
-    # B) "✅ Закрили сьогодні" (кат.20, WON, змінено сьогодні, тільки підключення)
-    closed_list = await b24_list(
-        "crm.deal.list",
-        order={"DATE_MODIFY": "ASC"},
-        filter={"STAGE_ID": "C20:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to, "TYPE_ID": conn_type_ids},
-        select=["ID"]
-    )
-    closed_conn = len(closed_list)
+    # B) "✅ Закрили сьогодні" — рахуємо по CLOSEDATE, тільки підключення у кат.20, стадія WON
+closed_list = await b24_list(
+    "crm.deal.list",
+    order={"CLOSEDATE": "ASC"},
+    filter={
+        "CATEGORY_ID": 20,
+        "STAGE_ID": "C20:WON",
+        ">=CLOSEDATE": frm,
+        "<CLOSEDATE": to,
+        "TYPE_ID": conn_type_ids,  # лише "Підключення"
+    },
+    select=["ID"]
+)
+closed_conn = len(closed_list)
+
+# (необов’язково, але зручно для перевірки)
+log.info("[summary] closed(ids)=%s", [int(d["ID"]) for d in closed_list])
+
 
     # C) "📊 Активні на бригадах" (відкриті у бригадних стадіях)
     open_cat20 = await b24_list(
