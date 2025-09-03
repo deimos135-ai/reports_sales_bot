@@ -1,7 +1,7 @@
-# main.py — Fiber Reports (summary-only, dedup fix, robust "closed")
+# main.py — Fiber Reports (summary-only, with "created today" = cat0 exact-created + cat20 moved-to-brigade-today)
 import asyncio, html, json, logging, os
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 from fastapi import FastAPI, Request
@@ -22,8 +22,7 @@ REPORT_TZ_NAME = os.environ.get("REPORT_TZ", "Europe/Kyiv")
 REPORT_TZ = ZoneInfo(REPORT_TZ_NAME)
 REPORT_TIME = os.environ.get("REPORT_TIME", "19:00")  # HH:MM
 
-REPORT_SUMMARY_CHAT = int(os.environ.get("REPORT_SUMMARY_CHAT", "0"))  # optional
-DEBUG_IDS = os.environ.get("DEBUG_IDS", "0") == "1"
+REPORT_SUMMARY_CHAT = int(os.environ.get("REPORT_SUMMARY_CHAT", "0"))  # опційно
 
 # ------------------------ Logging -------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -93,7 +92,10 @@ def _is_connection(type_id: str, type_name: Optional[str] = None) -> bool:
         name = (_DEAL_TYPE_MAP.get(type_id, "") or "").strip().lower()
     return name in ("підключення", "подключение") or ("підключ" in name) or ("подключ" in name)
 
-# Brigade stages (cat.20)
+async def _connection_type_ids() -> List[str]:
+    m = await get_deal_type_map()
+    return [tid for tid, nm in m.items() if _is_connection(tid, nm)]
+
 _BRIGADE_STAGE = {1: "UC_XF8O6V", 2: "UC_0XLPCN", 3: "UC_204CP3", 4: "UC_TNEW3Z", 5: "UC_RMBZ37"}
 
 # ------------------------ Time helpers -------------------
@@ -123,120 +125,75 @@ async def _resolve_cat0_stage_ids() -> Tuple[str, str]:
         n = (nm or "").strip().lower()
         if n == "на конкретний день": exact_id = sid
         if n == "думають": think_id = sid
-    if not exact_id: exact_id = "5"         # fallback (з твого дампу)
-    if not think_id: think_id = "DETAILS"   # fallback
+    if not exact_id: exact_id = "5"         # fallback з дампу
+    if not think_id: think_id = "DETAILS"   # fallback з дампу
     return f"C0:{exact_id}", f"C0:{think_id}"
 
-async def _count_open_in_stage(cat_id: int, stage_full: str) -> int:
-    deals = await b24_list(
-        "crm.deal.list",
-        order={"ID": "DESC"},
-        filter={"CLOSED": "N", "CATEGORY_ID": cat_id, "STAGE_ID": stage_full},
-        select=["ID"],
-    )
+async def _count_open_in_stage(cat_id: int, stage_full: str, *, type_ids: Optional[List[str]] = None) -> int:
+    base_filter: Dict[str, Any] = {"CLOSED": "N", "CATEGORY_ID": cat_id, "STAGE_ID": stage_full}
+    if type_ids: base_filter["TYPE_ID"] = type_ids
+    deals = await b24_list("crm.deal.list", order={"ID": "DESC"}, filter=base_filter, select=["ID"])
     if deals: return len(deals)
-    # fallback на короткий код
     short = stage_full.split(":", 1)[-1]
-    deals_fb = await b24_list(
-        "crm.deal.list",
-        order={"ID": "DESC"},
-        filter={"CLOSED": "N", "CATEGORY_ID": cat_id, "STAGE_ID": short},
-        select=["ID"],
-    )
+    base_filter["STAGE_ID"] = short
+    deals_fb = await b24_list("crm.deal.list", order={"ID": "DESC"}, filter=base_filter, select=["ID"])
     return len(deals_fb)
 
 # ------------------------ Summary builder -----------------
 async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     label, frm, to = _day_bounds(offset_days)
-    type_map = await get_deal_type_map()
-
+    conn_type_ids = await _connection_type_ids()
     brigade_stage_ids = [f"C20:{v}" for v in _BRIGADE_STAGE.values()]
-    brigade_stage_set = set(brigade_stage_ids)
 
-    # 🆕 Подали — УНІКАЛЬНІ підключення, які СЬОГОДНІ були у будь-якій бригадній стадії (за DATE_MODIFY)
-    created_conn_ids: Set[int] = set()
-    try:
-        created_bulk = await b24_list(
-            "crm.deal.list",
-            order={"DATE_MODIFY": "ASC"},
-            filter={
-                "CATEGORY_ID": 20,
-                "STAGE_ID": brigade_stage_ids,  # IN
-                ">=DATE_MODIFY": frm,
-                "<DATE_MODIFY": to,
-            },
-            select=["ID", "TYPE_ID"],
-        )
-        for d in created_bulk:
-            tid = d.get("TYPE_ID") or ""
-            if _is_connection(tid, type_map.get(tid)):
-                try: created_conn_ids.add(int(d["ID"]))
-                except: pass
-    except Exception as e:
-        log.warning("bulk STAGE_ID filter failed, fallback per-stage: %s", e)
-        for st in brigade_stage_ids:
-            created = await b24_list(
-                "crm.deal.list",
-                order={"DATE_MODIFY": "ASC"},
-                filter={"CATEGORY_ID": 20, "STAGE_ID": st, ">=DATE_MODIFY": frm, "<DATE_MODIFY": to},
-                select=["ID", "TYPE_ID"],
-            )
-            for d in created:
-                tid = d.get("TYPE_ID") or ""
-                if _is_connection(tid, type_map.get(tid)):
-                    try: created_conn_ids.add(int(d["ID"]))
-                    except: pass
-    created_conn = len(created_conn_ids)
+    # A) "🆕 Подали сьогодні" = (cat0 exact created today) + (cat20 moved to any brigade stage today)
+    c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
 
-    # ✅ Закрили — угоди, що сьогодні стали WON у C20
-    #   Рахуємо як "підключення", якщо (а) TYPE_ID=підключення, або (б) ID був у created_conn_ids (ми знаємо, що він connection за сьогодні).
-    closed_conn_ids: Set[int] = set()
-    closed = await b24_list(
+    # A1: Кат.0, На конкретний день, створені сьогодні
+    created_cat0_exact = await b24_list(
+        "crm.deal.list",
+        order={"ID": "DESC"},
+        filter={">=DATE_CREATE": frm, "<DATE_CREATE": to, "CATEGORY_ID": 0,
+                "STAGE_ID": c0_exact_stage, "TYPE_ID": conn_type_ids},
+        select=["ID"]
+    )
+    # A2: Кат.20, переміщені сьогодні у будь-яку бригадну колонку
+    moved_cat20_to_brigade = await b24_list(
         "crm.deal.list",
         order={"DATE_MODIFY": "ASC"},
-        filter={"CATEGORY_ID": 20, "STAGE_ID": "C20:WON", ">=CLOSEDATE": frm, "<CLOSEDATE": to},
-        select=["ID", "TYPE_ID"],
+        filter={"CATEGORY_ID": 20, "STAGE_ID": brigade_stage_ids,
+                ">=DATE_MODIFY": frm, "<DATE_MODIFY": to, "TYPE_ID": conn_type_ids},
+        select=["ID"]
     )
-    for d in closed:
-        tid = d.get("TYPE_ID") or ""
-        cond_type = _is_connection(tid, type_map.get(tid))
-        try:
-            did = int(d["ID"])
-        except:
-            continue
-        if cond_type or (did in created_conn_ids):
-            closed_conn_ids.add(did)
-    closed_conn = len(closed_conn_ids)
+    created_total = len(created_cat0_exact) + len(moved_cat20_to_brigade)
 
-    # 📊 Активні — відкриті підключення, що зараз у бригадних стадіях
-    active_conn = 0
+    # B) "✅ Закрили сьогодні" (кат.20, WON, змінено сьогодні, тільки підключення)
+    closed_list = await b24_list(
+        "crm.deal.list",
+        order={"DATE_MODIFY": "ASC"},
+        filter={"STAGE_ID": "C20:WON", ">=DATE_MODIFY": frm, "<DATE_MODIFY": to, "TYPE_ID": conn_type_ids},
+        select=["ID"]
+    )
+    closed_conn = len(closed_list)
+
+    # C) "📊 Активні на бригадах" (відкриті у бригадних стадіях)
     open_cat20 = await b24_list(
         "crm.deal.list",
         order={"ID": "DESC"},
-        filter={"CLOSED": "N", "CATEGORY_ID": 20},
-        select=["ID", "TYPE_ID", "STAGE_ID"],
+        filter={"CLOSED": "N", "CATEGORY_ID": 20, "STAGE_ID": brigade_stage_ids, "TYPE_ID": conn_type_ids},
+        select=["ID"]
     )
-    for d in open_cat20:
-        if str(d.get("STAGE_ID") or "") in brigade_stage_set:
-            tid = d.get("TYPE_ID") or ""
-            if _is_connection(tid, type_map.get(tid)):
-                active_conn += 1
+    active_conn = len(open_cat20)
 
-    # Категорія 0 — «На конкретний день» та «Думають»
-    c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
-    exact_cnt = await _count_open_in_stage(0, c0_exact_stage)
-    think_cnt = await _count_open_in_stage(0, c0_think_stage)
+    # D) Категорія 0 — відкриті у потрібних стадіях
+    exact_cnt = await _count_open_in_stage(0, c0_exact_stage, type_ids=conn_type_ids)
+    think_cnt = await _count_open_in_stage(0, c0_think_stage, type_ids=conn_type_ids)
 
-    if DEBUG_IDS:
-        log.info("[DEBUG_IDS] created_conn_ids=%s", sorted(created_conn_ids))
-        log.info("[DEBUG_IDS] closed_conn_ids=%s", sorted(closed_conn_ids))
-
-    log.info("[summary] created(unique)=%s, closed=%s, active=%s, exact=%s, think=%s",
-             created_conn, closed_conn, active_conn, exact_cnt, think_cnt)
+    log.info("[summary] created(calc)=%s  closed=%s  active=%s  exact=%s  think=%s",
+             created_total, closed_conn, active_conn, exact_cnt, think_cnt)
 
     return {
         "date_label": label,
-        "connections": {"created": created_conn, "closed": closed_conn, "active": active_conn},
+        "connections": {"created": created_total, "closed": closed_conn, "active": active_conn},
         "cat0": {"exact_day": exact_cnt, "think": think_cnt},
     }
 
