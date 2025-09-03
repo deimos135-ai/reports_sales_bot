@@ -205,9 +205,11 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
             "STAGE_SEMANTIC_ID": "P",
             "TYPE_ID": conn_type_ids,
         },
-        select=["ID"]
+        select=["ID", "TYPE_ID"]
     )
-    active_conn = len(active_open)
+    log.info("active_open: %s deals; by TYPE_ID: %s",
+         len(active_open),
+         {t: sum(1 for d in active_open if d.get("TYPE_ID")==t) for t in set(d.get("TYPE_ID") for d in active_open)})
 
     # D) Категорія 0: відкриті у "На конкретний день" та "Думають"
     exact_cnt = await _count_open_in_stage(0, c0_exact_stage, conn_type_ids)
