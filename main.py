@@ -1,4 +1,4 @@
-# main.py — Fiber Reports (summary-only, dedup fix & optional debug IDs)
+# main.py — Fiber Reports (summary-only, dedup fix, robust "closed")
 import asyncio, html, json, logging, os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple, Set
@@ -123,8 +123,8 @@ async def _resolve_cat0_stage_ids() -> Tuple[str, str]:
         n = (nm or "").strip().lower()
         if n == "на конкретний день": exact_id = sid
         if n == "думають": think_id = sid
-    if not exact_id: exact_id = "5"         # fallback by your dump
-    if not think_id: think_id = "DETAILS"   # fallback by your dump
+    if not exact_id: exact_id = "5"         # fallback (з твого дампу)
+    if not think_id: think_id = "DETAILS"   # fallback
     return f"C0:{exact_id}", f"C0:{think_id}"
 
 async def _count_open_in_stage(cat_id: int, stage_full: str) -> int:
@@ -135,7 +135,7 @@ async def _count_open_in_stage(cat_id: int, stage_full: str) -> int:
         select=["ID"],
     )
     if deals: return len(deals)
-    # fallback for short code
+    # fallback на короткий код
     short = stage_full.split(":", 1)[-1]
     deals_fb = await b24_list(
         "crm.deal.list",
@@ -153,16 +153,15 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     brigade_stage_ids = [f"C20:{v}" for v in _BRIGADE_STAGE.values()]
     brigade_stage_set = set(brigade_stage_ids)
 
-    # 🆕 Подали — УНІКАЛЬНІ підключення, які СЬОГОДНІ знаходились у будь-якій бригадній колонці (за DATE_MODIFY)
+    # 🆕 Подали — УНІКАЛЬНІ підключення, які СЬОГОДНІ були у будь-якій бригадній стадії (за DATE_MODIFY)
     created_conn_ids: Set[int] = set()
-    # Один запит з масивом стадій (Bitrix приймає масиви у фільтрі) — якщо раптом не спрацює у вашому порталі, залишимо безпечний цикл.
     try:
         created_bulk = await b24_list(
             "crm.deal.list",
             order={"DATE_MODIFY": "ASC"},
             filter={
                 "CATEGORY_ID": 20,
-                "STAGE_ID": brigade_stage_ids,  # список-умова IN
+                "STAGE_ID": brigade_stage_ids,  # IN
                 ">=DATE_MODIFY": frm,
                 "<DATE_MODIFY": to,
             },
@@ -189,7 +188,8 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
                     except: pass
     created_conn = len(created_conn_ids)
 
-    # ✅ Закрили — всі підключення в C20, що стали WON сьогодні
+    # ✅ Закрили — угоди, що сьогодні стали WON у C20
+    #   Рахуємо як "підключення", якщо (а) TYPE_ID=підключення, або (б) ID був у created_conn_ids (ми знаємо, що він connection за сьогодні).
     closed_conn_ids: Set[int] = set()
     closed = await b24_list(
         "crm.deal.list",
@@ -199,12 +199,16 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     )
     for d in closed:
         tid = d.get("TYPE_ID") or ""
-        if _is_connection(tid, type_map.get(tid)):
-            try: closed_conn_ids.add(int(d["ID"]))
-            except: pass
+        cond_type = _is_connection(tid, type_map.get(tid))
+        try:
+            did = int(d["ID"])
+        except:
+            continue
+        if cond_type or (did in created_conn_ids):
+            closed_conn_ids.add(did)
     closed_conn = len(closed_conn_ids)
 
-    # 📊 Активні на бригадах — відкриті підключення, що зараз у бригадних колонках
+    # 📊 Активні — відкриті підключення, що зараз у бригадних стадіях
     active_conn = 0
     open_cat20 = await b24_list(
         "crm.deal.list",
