@@ -202,13 +202,13 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
         filter={
             "CLOSED": "N",
             "CATEGORY_ID": 20,
-            "STAGE_ID": list(_BRIGADE_STAGE_FULL),
+            "STAGE_SEMANTIC_ID": "P",
             "TYPE_ID": conn_type_ids,
         },
         select=["ID"]
     )
     active_conn = len(active_open)
-
+    
     # D) Категорія 0: відкриті у "На конкретний день" та "Думають"
     exact_cnt = await _count_open_in_stage(0, c0_exact_stage, conn_type_ids)
     think_cnt = await _count_open_in_stage(0, c0_think_stage, conn_type_ids)
