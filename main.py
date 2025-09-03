@@ -24,10 +24,6 @@ REPORT_TIME = os.environ.get("REPORT_TIME", "19:00")  # HH:MM
 
 REPORT_SUMMARY_CHAT = int(os.environ.get("REPORT_SUMMARY_CHAT", "0"))  # опційно
 
-# NEW: точне визначення TYPE_ID для "Підключення"
-CONNECTION_TYPE_ID_ENV = os.environ.get("CONNECTION_TYPE_ID")  # напр. "SALE"
-CONNECTION_TYPE_NAME = os.environ.get("CONNECTION_TYPE_NAME", "Підключення|Подключение")
-
 # ------------------------ Logging -------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("report_bot")
@@ -90,39 +86,7 @@ async def get_deal_type_map() -> Dict[str, str]:
         log.info("[cache] DEAL_TYPE: %s", len(_DEAL_TYPE_MAP))
     return _DEAL_TYPE_MAP
 
-# exact TYPE_ID resolver for "Підключення"
-_CONNECTION_TYPE_ID_CACHE: Optional[str] = None
-async def get_connection_type_id() -> str:
-    """
-    Повертає рівно один TYPE_ID для 'Підключення'.
-    Порядок: ENV -> пошук за назвою(ами) -> помилка.
-    """
-    global _CONNECTION_TYPE_ID_CACHE
-    if _CONNECTION_TYPE_ID_CACHE:
-        return _CONNECTION_TYPE_ID_CACHE
-
-    if CONNECTION_TYPE_ID_ENV:
-        _CONNECTION_TYPE_ID_CACHE = CONNECTION_TYPE_ID_ENV.strip()
-        log.info("[config] Using CONNECTION_TYPE_ID from env: %s", _CONNECTION_TYPE_ID_CACHE)
-        return _CONNECTION_TYPE_ID_CACHE
-
-    names = [n.strip() for n in CONNECTION_TYPE_NAME.split("|") if n.strip()]
-    m = await get_deal_type_map()
-    inv = { (v or "").strip().lower(): k for k, v in m.items() }
-    for nm in names:
-        key = nm.lower()
-        if key in inv:
-            _CONNECTION_TYPE_ID_CACHE = inv[key]
-            log.info("[resolver] Found TYPE_ID by name '%s' -> %s", nm, _CONNECTION_TYPE_ID_CACHE)
-            return _CONNECTION_TYPE_ID_CACHE
-
-    raise RuntimeError(
-        f"Не зміг визначити TYPE_ID для назв: {names}. "
-        f"Вкажи змінну оточення CONNECTION_TYPE_ID або CONNECTION_TYPE_NAME."
-    )
-
 def _is_connection(type_id: str, type_name: Optional[str] = None) -> bool:
-    # (залишено на випадок потреби; більше не використовується для підрахунків)
     name = (type_name or "").strip().lower()
     if not name and _DEAL_TYPE_MAP:
         name = (_DEAL_TYPE_MAP.get(type_id, "") or "").strip().lower()
@@ -133,7 +97,6 @@ def _is_connection(type_id: str, type_name: Optional[str] = None) -> bool:
     )
 
 async def _connection_type_ids() -> List[str]:
-    # залишено для сумісності; не використовується в підрахунках
     m = await get_deal_type_map()
     return [tid for tid, nm in m.items() if _is_connection(tid, nm)]
 
@@ -172,9 +135,9 @@ async def _resolve_cat0_stage_ids() -> Tuple[str, str]:
     if not think_id: think_id = "DETAILS"   # fallback
     return f"C0:{exact_id}", f"C0:{think_id}"
 
-async def _count_open_in_stage(cat_id: int, stage_full: str, type_id: Optional[str] = None) -> int:
+async def _count_open_in_stage(cat_id: int, stage_full: str, type_ids: Optional[List[str]] = None) -> int:
     flt: Dict[str, Any] = {"CLOSED": "N", "CATEGORY_ID": cat_id, "STAGE_ID": stage_full}
-    if type_id: flt["TYPE_ID"] = type_id
+    if type_ids: flt["TYPE_ID"] = type_ids
     deals = await b24_list("crm.deal.list", order={"ID": "DESC"}, filter=flt, select=["ID"])
     if deals: return len(deals)
     # fallback: короткий STAGE_ID
@@ -186,8 +149,8 @@ async def _count_open_in_stage(cat_id: int, stage_full: str, type_id: Optional[s
 # ------------------------ Summary builder -----------------
 async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     label, frm, to = _day_bounds(offset_days)
-    conn_type_id = await get_connection_type_id()  # <-- ГОЛОВНЕ: один конкретний TYPE_ID
-    log.info("[summary] Using TYPE_ID=%s for 'Підключення'", conn_type_id)
+    type_map = await get_deal_type_map()
+    conn_type_ids = await _connection_type_ids()
 
     # A) "🆕 Подали сьогодні":
     #   A1: кат.0, стадія "На конкретний день", TYPE=Підключення, DATE_CREATE у діапазоні
@@ -198,7 +161,7 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
         filter={
             "CATEGORY_ID": 0,
             "STAGE_ID": c0_exact_stage,
-            "TYPE_ID": conn_type_id,
+            "TYPE_ID": conn_type_ids,
             ">=DATE_CREATE": frm, "<DATE_CREATE": to,
         },
         select=["ID"]
@@ -211,21 +174,21 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
         filter={
             "CATEGORY_ID": 20,
             "STAGE_ID": list(_BRIGADE_STAGE_FULL),  # масив значень ок
-            "TYPE_ID": conn_type_id,
+            "TYPE_ID": conn_type_ids,
             ">=DATE_MODIFY": frm, "<DATE_MODIFY": to,
         },
         select=["ID"]
     )
     created_conn = len(created_c0_exact) + len(created_to_brigades)
 
-    # B) "✅ Закрили сьогодні" — по CLOSEDATE, кат.20, стадія WON
+    # B) "✅ Закрили сьогодні" — рахуємо по CLOSEDATE, тільки підключення у кат.20, стадія WON
     closed_list = await b24_list(
         "crm.deal.list",
         order={"CLOSEDATE": "ASC"},
         filter={
             "CATEGORY_ID": 20,
             "STAGE_ID": "C20:WON",
-            "TYPE_ID": conn_type_id,
+            "TYPE_ID": conn_type_ids,
             ">=CLOSEDATE": frm, "<CLOSEDATE": to,
         },
         select=["ID"]
@@ -239,16 +202,17 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
         filter={
             "CLOSED": "N",
             "CATEGORY_ID": 20,
+            "STAGE_ID": list(_BRIGADE_STAGE_FULL),
+            "TYPE_ID": conn_type_ids,
             "STAGE_SEMANTIC_ID": "P",
-            "TYPE_ID": conn_type_id,
         },
         select=["ID"]
     )
     active_conn = len(active_open)
 
     # D) Категорія 0: відкриті у "На конкретний день" та "Думають"
-    exact_cnt = await _count_open_in_stage(0, c0_exact_stage, conn_type_id)
-    think_cnt = await _count_open_in_stage(0, c0_think_stage, conn_type_id)
+    exact_cnt = await _count_open_in_stage(0, c0_exact_stage, conn_type_ids)
+    think_cnt = await _count_open_in_stage(0, c0_think_stage, conn_type_ids)
 
     log.info("[summary] created(today)=%s (c0_exact=%s + to_brigades=%s), closed=%s, active=%s, exact=%s, think=%s",
              created_conn, len(created_c0_exact), len(created_to_brigades), closed_conn, active_conn, exact_cnt, think_cnt)
