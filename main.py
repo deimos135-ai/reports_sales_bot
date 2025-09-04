@@ -1,4 +1,4 @@
-# main.py — Fiber Reports (summary-only) + Service Today + Telephony via Bitrix
+# main.py — Fiber Reports (summary-only) + Service Today + Telephony via Bitrix Voximplant
 import asyncio, html, json, logging, os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -146,10 +146,36 @@ async def _count_open_in_stage(cat_id: int, stage_full: str, type_ids: Optional[
     deals_fb = await b24_list("crm.deal.list", order={"ID": "DESC"}, filter=flt, select=["ID"])
     return len(deals_fb)
 
-# ------------------------ Telephony via Bitrix ------------
+# ------------------------ Telephony (Voximplant first) ---
+async def _b24_vox_fetch(frm_iso: str, to_iso: str, *, limit: int = 200) -> List[Dict[str, Any]]:
+    """
+    Voximplant статистика з пагінацією через voximplant.statistic.get.
+    """
+    offset = 0
+    out: List[Dict[str, Any]] = []
+    while True:
+        res = await b24(
+            "voximplant.statistic.get",
+            FILTER={">=CALL_START_DATE": frm_iso, "<CALL_START_DATE": to_iso},
+            ORDER={"CALL_START_DATE": "ASC"},
+            LIMIT=limit,
+            OFFSET=offset,
+        )
+        chunk = []
+        if isinstance(res, dict):
+            # у Voximplant мапа часто лежить у "items"
+            chunk = res.get("items") or res.get("result") or []
+        elif isinstance(res, list):
+            chunk = res
+        out.extend(chunk)
+        if not chunk or len(chunk) < limit:
+            break
+        offset += limit
+    return out
+
 async def _b24_telephony_fetch(frm_iso: str, to_iso: str, *, limit: int = 200) -> List[Dict[str, Any]]:
     """
-    Тягнемо всі дзвінки за інтервал через telephony.statistic.get з пагінацією OFFSET/LIMIT.
+    Фолбек на telephony.statistic.get (якщо Voximplant не повернув).
     """
     offset = 0
     out: List[Dict[str, Any]] = []
@@ -161,7 +187,6 @@ async def _b24_telephony_fetch(frm_iso: str, to_iso: str, *, limit: int = 200) -
             LIMIT=limit,
             OFFSET=offset,
         )
-        # res може бути {"items":[...],"total":N} або просто список
         chunk = []
         if isinstance(res, dict):
             chunk = res.get("items") or res.get("result") or []
@@ -173,40 +198,55 @@ async def _b24_telephony_fetch(frm_iso: str, to_iso: str, *, limit: int = 200) -
         offset += limit
     return out
 
-def _is_missed_b24(call: Dict[str, Any]) -> bool:
+def _is_missed_call(call: Dict[str, Any]) -> bool:
     """
-    Евристика для пропущених: вхідні (CALL_TYPE=2) з тривалістю 0 або з fail-кодами no-answer/busy/timeout.
+    Пропущений: вхідний (CALL_TYPE=2 або CALL_DIRECTION=2) і тривалість 0
+    або відомі "no-answer/busy/timeout" коди.
     """
     call_type = int(call.get("CALL_TYPE") or call.get("CALL_DIRECTION") or 0)
     duration = int(call.get("CALL_DURATION") or call.get("DURATION") or 0)
     failed_code = str(call.get("CALL_FAILED_CODE") or call.get("FAILED_CODE") or "").upper()
     if call_type == 2 and duration == 0:
         return True
-    # поширені коди: NO_ANSWER, 603, BUSY, 486, 480, 408
     return failed_code in {"NO_ANSWER", "BUSY", "603", "486", "480", "408"}
 
-async def build_telephony_summary_b24(frm_iso: str, to_iso: str) -> Dict[str, Any]:
-    calls = await _b24_telephony_fetch(frm_iso, to_iso)
+def _extract_operator_name(call: Dict[str, Any]) -> str:
+    """
+    Під Voximplant/Telephony ключі відрізняються. Пробуємо по черзі.
+    """
+    for key in ("PORTAL_USER_NAME", "USER_NAME", "ACCOUNT_USER_NAME", "OPERATOR_NAME"):
+        val = (call.get(key) or "").strip()
+        if val:
+            return val
+    uid = call.get("PORTAL_USER_ID") or call.get("USER_ID") or call.get("ACCOUNT_USER_ID")
+    return f"ID {uid}" if uid is not None else "невідомий"
+
+async def build_telephony_summary(frm_iso: str, to_iso: str) -> Dict[str, Any]:
+    calls = await _b24_vox_fetch(frm_iso, to_iso)
+    source = "voximplant"
+    if not calls:
+        calls = await _b24_telephony_fetch(frm_iso, to_iso)
+        source = "telephony"
+    log.info("[telephony] source=%s, got=%s records", source, len(calls))
+
     missed_total = 0
     out_total = 0
-    per_user: Dict[str, Dict[str, int]] = {}  # key: name/ID -> counters
+    per_user: Dict[str, Dict[str, int]] = {}
 
     for c in calls:
         call_type = int(c.get("CALL_TYPE") or c.get("CALL_DIRECTION") or 0)  # 1=out, 2=in
-        user_id = c.get("PORTAL_USER_ID")
-        user_name = (c.get("PORTAL_USER_NAME") or "").strip()
-        display = user_name or (f"ID {user_id}" if user_id is not None else "невідомий")
-
         if call_type == 1:
             out_total += 1
-            per_user.setdefault(display, {"missed": 0, "out": 0})
-            per_user[display]["out"] += 1
-        elif call_type == 2 and _is_missed_b24(c):
+            name = _extract_operator_name(c)
+            per_user.setdefault(name, {"missed": 0, "out": 0})
+            per_user[name]["out"] += 1
+        elif call_type == 2 and _is_missed_call(c):
             missed_total += 1
-            per_user.setdefault(display, {"missed": 0, "out": 0})
-            per_user[display]["missed"] += 1
+            name = _extract_operator_name(c)
+            per_user.setdefault(name, {"missed": 0, "out": 0})
+            per_user[name]["missed"] += 1
 
-    return {"missed_total": missed_total, "out_total": out_total, "operators": per_user}
+    return {"missed_total": missed_total, "out_total": out_total, "operators": per_user, "source": source}
 
 # ------------------------ Summary builder -----------------
 async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
@@ -288,12 +328,12 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     )
     service_today = len(service_opened_today)
 
-    # F) Телефонія через Bitrix
+    # F) Телефонія через Voximplant (фолбек на telephony)
     telephony_stats: Optional[Dict[str, Any]] = None
     try:
-        telephony_stats = await build_telephony_summary_b24(frm, to)
+        telephony_stats = await build_telephony_summary(frm, to)
     except Exception as e:
-        log.warning("telephony stats via Bitrix failed: %s", e)
+        log.warning("telephony stats failed: %s", e)
 
     log.info("[summary] created=%s (c0_exact=%s + to_brigades=%s), closed=%s, active=%s, exact=%s, think=%s, service_today=%s",
              created_conn, len(created_c0_exact), len(created_to_brigades),
