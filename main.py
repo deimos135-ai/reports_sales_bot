@@ -1,7 +1,8 @@
-# main.py — Fiber Reports (summary-only, fixed CLOSEDATE & "submitted today" logic + service today)
+# main.py — Fiber Reports (summary-only + Telephony via Voximplant)
 import asyncio, html, json, logging, os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from collections import defaultdict
 
 import aiohttp
 from fastapi import FastAPI, Request
@@ -21,8 +22,13 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "secret")
 REPORT_TZ_NAME = os.environ.get("REPORT_TZ", "Europe/Kyiv")
 REPORT_TZ = ZoneInfo(REPORT_TZ_NAME)
 REPORT_TIME = os.environ.get("REPORT_TIME", "19:00")  # HH:MM
-
 REPORT_SUMMARY_CHAT = int(os.environ.get("REPORT_SUMMARY_CHAT", "0"))  # опційно
+
+# Telephony
+TELEPHONY_ENABLED = os.environ.get("TELEPHONY_ENABLED", "true").lower() in ("1","true","yes","y")
+TELEPHONY_SOURCE = os.environ.get("TELEPHONY_SOURCE", "voximplant").strip().lower()  # "voximplant" | "telephony"
+_TELEPHONY_OPERATORS_RAW = os.environ.get("TELEPHONY_OPERATORS", "").strip()
+TELEPHONY_OPERATORS: Dict[str, str] = json.loads(_TELEPHONY_OPERATORS_RAW) if _TELEPHONY_OPERATORS_RAW else {}
 
 # ------------------------ Logging -------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -114,6 +120,18 @@ def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str]:
     label = start_local.strftime("%d.%m.%Y")
     return label, start_utc.isoformat(), end_utc.isoformat()
 
+def _day_bounds_both(offset_days: int = 0) -> Tuple[str, str, str, str, str]:
+    """
+    label, utc_start_iso, utc_end_iso, local_start_iso, local_end_iso
+    Потрібно для телефонії (де зручно фільтрувати локальною добою).
+    """
+    now_local = datetime.now(REPORT_TZ)
+    start_local = (now_local - timedelta(days=offset_days)).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = start_local + timedelta(days=1)
+    start_utc = start_local.astimezone(timezone.utc).isoformat()
+    end_utc = end_local.astimezone(timezone.utc).isoformat()
+    return start_local.strftime("%d.%m.%Y"), start_utc, end_utc, start_local.isoformat(), end_local.isoformat()
+
 # ------------------------ CAT0 stage resolving ------------
 _CAT0_STAGES: Optional[Dict[str, str]] = None
 async def _cat0_stages() -> Dict[str, str]:
@@ -146,14 +164,13 @@ async def _count_open_in_stage(cat_id: int, stage_full: str, type_ids: Optional[
     deals_fb = await b24_list("crm.deal.list", order={"ID": "DESC"}, filter=flt, select=["ID"])
     return len(deals_fb)
 
-# ------------------------ Summary builder -----------------
+# ------------------------ Summary builder (core) ----------
 async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     label, frm, to = _day_bounds(offset_days)
     type_map = await get_deal_type_map()
     conn_type_ids = await _connection_type_ids()
 
-    # A) "🆕 Подали сьогодні":
-    #   A1: кат.0, стадія "На конкретний день", TYPE=Підключення, DATE_CREATE у діапазоні
+    # A) 🆕 Подали сьогодні (кат.0 -> "На конкретний день" + кат.20 -> будь-яка бригадна стадія за DATE_MODIFY)
     c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
     created_c0_exact = await b24_list(
         "crm.deal.list",
@@ -166,31 +183,20 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
         },
         select=["ID"]
     )
-    #   A2: кат.20, переміщені у будь-яку бригадну стадію сьогодні (DATE_MODIFY),
-    #       беремо всі TYPE_ID і нижче поділимо на "підключення" та "сервіс"
-    moved_to_brigades_today = await b24_list(
+    created_to_brigades = await b24_list(
         "crm.deal.list",
         order={"DATE_MODIFY": "ASC"},
         filter={
             "CATEGORY_ID": 20,
             "STAGE_ID": list(_BRIGADE_STAGE_FULL),
+            "TYPE_ID": conn_type_ids,
             ">=DATE_MODIFY": frm, "<DATE_MODIFY": to,
         },
-        select=["ID", "TYPE_ID"]
+        select=["ID"]
     )
-    # розкладемо
-    created_conn_from_moves = 0
-    created_service_today = 0
-    for d in moved_to_brigades_today:
-        tid = d.get("TYPE_ID") or ""
-        if tid in conn_type_ids:
-            created_conn_from_moves += 1
-        else:
-            created_service_today += 1
+    created_conn = len(created_c0_exact) + len(created_to_brigades)
 
-    created_conn = len(created_c0_exact) + created_conn_from_moves
-
-    # B) "✅ Закрили сьогодні" — по CLOSEDATE, тільки підключення у кат.20, стадія WON
+    # B) ✅ Закрили сьогодні — тільки кат.20 WON, рахуємо по CLOSEDATE
     closed_list = await b24_list(
         "crm.deal.list",
         order={"CLOSEDATE": "ASC"},
@@ -204,7 +210,7 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     )
     closed_conn = len(closed_list)
 
-    # C) "📊 Активні на бригадах" — відкриті у бригадних, тип=Підключення
+    # C) 📊 Активні на бригадах (відкриті в бригадних стадіях, TYPE=Підключення)
     active_open = await b24_list(
         "crm.deal.list",
         order={"ID": "DESC"},
@@ -223,28 +229,100 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     exact_cnt = await _count_open_in_stage(0, c0_exact_stage, conn_type_ids)
     think_cnt = await _count_open_in_stage(0, c0_think_stage, conn_type_ids)
 
-    log.info("[summary] created_conn=%s (c0_exact=%s + to_brigades_conn=%s), "
-             "service_created_today=%s, closed=%s, active=%s, exact=%s, think=%s",
-             created_conn, len(created_c0_exact), created_conn_from_moves,
-             created_service_today, closed_conn, active_conn, exact_cnt, think_cnt)
+    log.info("[summary] created(today)=%s (c0_exact=%s + to_brigades=%s), closed=%s, active=%s, exact=%s, think=%s",
+             created_conn, len(created_c0_exact), len(created_to_brigades), closed_conn, active_conn, exact_cnt, think_cnt)
 
     return {
         "date_label": label,
-        "connections": {
-            "created": created_conn,
-            "closed": closed_conn,
-            "active": active_conn
-        },
-        "service": {
-            "created_today": created_service_today
-        },
+        "connections": {"created": created_conn, "closed": closed_conn, "active": active_conn},
         "cat0": {"exact_day": exact_cnt, "think": think_cnt},
     }
 
-def format_company_summary(d: Dict[str, Any]) -> str:
-    dl = d["date_label"]
-    c = d["connections"]; c0 = d["cat0"]; s = d["service"]
-    return "\n".join([
+# ------------------------ Telephony summary ---------------
+async def build_telephony_summary(offset_days: int = 0) -> Optional[Dict[str, Any]]:
+    if not TELEPHONY_ENABLED:
+        return None
+
+    label, frm_utc, to_utc, frm_local, to_local = _day_bounds_both(offset_days)
+
+    def _is_incoming(v: Any) -> bool:
+        s = str(v).upper()
+        return s in ("1", "INCOMING", "IN", "VOX_IN")
+    def _is_outgoing(v: Any) -> bool:
+        s = str(v).upper()
+        return s in ("2", "OUTGOING", "OUT", "VOX_OUT")
+    def _duration(rec: Dict[str, Any]) -> int:
+        for k in ("CALL_DURATION", "DURATION", "VOX_DURATION", "RECORD_DURATION"):
+            if k in rec and rec[k] is not None:
+                try: return int(rec[k])
+                except: pass
+        return 0
+    def _failed_code(rec: Dict[str, Any]) -> str:
+        for k in ("CALL_FAILED_CODE", "FAILED_CODE", "VOX_FAILED_CODE", "REASON"):
+            v = rec.get(k)
+            if v: return str(v).upper()
+        return ""
+    def _operator_id(rec: Dict[str, Any]) -> str:
+        for k in ("PORTAL_USER_ID", "USER_ID", "RESPONSIBLE_ID", "PORTAL_USER"):
+            v = rec.get(k)
+            if v is not None and str(v).strip() != "":
+                return str(v)
+        return "0"
+
+    MISSED_CODES = {"NO_ANSWER", "BUSY", "DECLINE", "CANCEL", "FAILED"}
+
+    if TELEPHONY_SOURCE == "voximplant":
+        method = "voximplant.statistic.get"
+    else:
+        method = "telephony.statistic.get"
+
+    calls = await b24_list(
+        method,
+        order={"ID": "ASC"},
+        filter={">=START_DATE": frm_local, "<START_DATE": to_local},
+    )
+
+    missed_total = 0
+    outbound_total = 0
+    per_operator: Dict[str, Dict[str, int]] = defaultdict(lambda: {"missed": 0, "outbound": 0})
+
+    for c in calls:
+        direction = c.get("CALL_TYPE", c.get("INCOMING", c.get("DIRECTION")))
+        dur = _duration(c)
+        uid = _operator_id(c)
+        fcode = _failed_code(c)
+
+        if _is_incoming(direction):
+            if dur == 0 or fcode in MISSED_CODES:
+                missed_total += 1
+                per_operator[uid]["missed"] += 1
+        elif _is_outgoing(direction):
+            outbound_total += 1
+            per_operator[uid]["outbound"] += 1
+
+    breakdown_lines: List[str] = []
+    for uid in sorted(per_operator.keys(), key=lambda x: int(x) if str(x).isdigit() else 10**9):
+        name = TELEPHONY_OPERATORS.get(uid, f"ID {uid}")
+        st = per_operator[uid]
+        if st["missed"] or st["outbound"]:
+            breakdown_lines.append(f"• {name}: пропущені — <b>{st['missed']}</b>, набрані — <b>{st['outbound']}</b>")
+
+    log.info("[telephony:%s] missed=%s, outbound=%s; sample=%s",
+             TELEPHONY_SOURCE, missed_total, outbound_total, calls[0] if calls else "no-calls")
+
+    return {
+        "date_label": label,
+        "missed_total": missed_total,
+        "outbound_total": outbound_total,
+        "breakdown_lines": breakdown_lines,
+    }
+
+# ------------------------ Formatting ----------------------
+def compose_summary_message(core: Dict[str, Any], tel: Optional[Dict[str, Any]]) -> str:
+    dl = core["date_label"]
+    c = core["connections"]; c0 = core["cat0"]
+
+    lines = [
         f"🗓 <b>Дата: {dl}</b>",
         "",
         "━━━━━━━━━━━━━━━",
@@ -252,12 +330,26 @@ def format_company_summary(d: Dict[str, Any]) -> str:
         f"🆕 Подали: <b>{c['created']}</b>",
         f"✅ Закрили: <b>{c['closed']}</b>",
         f"📊 Активні на бригадах: <b>{c['active']}</b>",
+        "",
         f"📅 На конкретний день: <b>{c0['exact_day']}</b>",
         f"💭 Думають: <b>{c0['think']}</b>",
-        "━━━━━━━━━━━━━━━",
-        f"🛠 Сервісні заявки сьогодні: <b>{s['created_today']}</b>",
-        "━━━━━━━━━━━━━━━",
-    ])
+    ]
+
+    if tel is not None:
+        lines += [
+            "",
+            "━━━━━━━━━━━━━━━",
+            "📞 <b>Телефонія</b>",
+            f"🔕 Пропущених: <b>{tel['missed_total']}</b>",
+            f"📤 Набраних: <b>{tel['outbound_total']}</b>",
+        ]
+        if tel["breakdown_lines"]:
+            lines.append("")
+            lines.append("👥 По операторам:")
+            lines.extend(tel["breakdown_lines"])
+
+    lines.append("━━━━━━━━━━━━━━━")
+    return "\n".join(lines)
 
 # ------------------------ Send helpers -------------------
 async def _safe_send(chat_id: int, text: str):
@@ -280,8 +372,9 @@ async def _safe_send(chat_id: int, text: str):
 
 async def send_company_summary_to_chat(target_chat: int, offset_days: int = 0) -> None:
     try:
-        data = await build_company_summary(offset_days)
-        await _safe_send(target_chat, format_company_summary(data))
+        core = await build_company_summary(offset_days)
+        tel = await build_telephony_summary(offset_days) if TELEPHONY_ENABLED else None
+        await _safe_send(target_chat, compose_summary_message(core, tel))
     except Exception as e:
         log.exception("company summary failed for chat %s", target_chat)
         await _safe_send(target_chat, f"❗️Помилка формування сумарного звіту:\n<code>{html.escape(str(e))}</code>")
@@ -305,9 +398,7 @@ async def report_now(m: Message):
         offset = int(parts[1])
 
     await m.answer("🔄 Формую сумарний звіт…")
-    # 1) завжди відповідаємо в той чат, де команда
     await send_company_summary_to_chat(m.chat.id, offset)
-    # 2) додатково — у службовий чат, якщо налаштований і він інший
     if REPORT_SUMMARY_CHAT and REPORT_SUMMARY_CHAT != m.chat.id:
         await send_company_summary_to_chat(REPORT_SUMMARY_CHAT, offset)
     await m.answer("✅ Готово")
