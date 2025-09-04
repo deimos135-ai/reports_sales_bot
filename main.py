@@ -1,4 +1,4 @@
-# main.py — Fiber Reports (summary-only, fixed CLOSEDATE & "submitted today" logic)
+# main.py — Fiber Reports (summary-only, fixed CLOSEDATE & "submitted today" logic + service today)
 import asyncio, html, json, logging, os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -167,21 +167,30 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
         select=["ID"]
     )
     #   A2: кат.20, переміщені у будь-яку бригадну стадію сьогодні (DATE_MODIFY),
-    #       TYPE=Підключення
-    created_to_brigades = await b24_list(
+    #       беремо всі TYPE_ID і нижче поділимо на "підключення" та "сервіс"
+    moved_to_brigades_today = await b24_list(
         "crm.deal.list",
         order={"DATE_MODIFY": "ASC"},
         filter={
             "CATEGORY_ID": 20,
-            "STAGE_ID": list(_BRIGADE_STAGE_FULL),  # масив значень ок
-            "TYPE_ID": conn_type_ids,
+            "STAGE_ID": list(_BRIGADE_STAGE_FULL),
             ">=DATE_MODIFY": frm, "<DATE_MODIFY": to,
         },
-        select=["ID"]
+        select=["ID", "TYPE_ID"]
     )
-    created_conn = len(created_c0_exact) + len(created_to_brigades)
+    # розкладемо
+    created_conn_from_moves = 0
+    created_service_today = 0
+    for d in moved_to_brigades_today:
+        tid = d.get("TYPE_ID") or ""
+        if tid in conn_type_ids:
+            created_conn_from_moves += 1
+        else:
+            created_service_today += 1
 
-    # B) "✅ Закрили сьогодні" — рахуємо по CLOSEDATE, тільки підключення у кат.20, стадія WON
+    created_conn = len(created_c0_exact) + created_conn_from_moves
+
+    # B) "✅ Закрили сьогодні" — по CLOSEDATE, тільки підключення у кат.20, стадія WON
     closed_list = await b24_list(
         "crm.deal.list",
         order={"CLOSEDATE": "ASC"},
@@ -214,18 +223,27 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     exact_cnt = await _count_open_in_stage(0, c0_exact_stage, conn_type_ids)
     think_cnt = await _count_open_in_stage(0, c0_think_stage, conn_type_ids)
 
-    log.info("[summary] created(today)=%s (c0_exact=%s + to_brigades=%s), closed=%s, active=%s, exact=%s, think=%s",
-             created_conn, len(created_c0_exact), len(created_to_brigades), closed_conn, active_conn, exact_cnt, think_cnt)
+    log.info("[summary] created_conn=%s (c0_exact=%s + to_brigades_conn=%s), "
+             "service_created_today=%s, closed=%s, active=%s, exact=%s, think=%s",
+             created_conn, len(created_c0_exact), created_conn_from_moves,
+             created_service_today, closed_conn, active_conn, exact_cnt, think_cnt)
 
     return {
         "date_label": label,
-        "connections": {"created": created_conn, "closed": closed_conn, "active": active_conn},
+        "connections": {
+            "created": created_conn,
+            "closed": closed_conn,
+            "active": active_conn
+        },
+        "service": {
+            "created_today": created_service_today
+        },
         "cat0": {"exact_day": exact_cnt, "think": think_cnt},
     }
 
 def format_company_summary(d: Dict[str, Any]) -> str:
     dl = d["date_label"]
-    c = d["connections"]; c0 = d["cat0"]
+    c = d["connections"]; c0 = d["cat0"]; s = d["service"]
     return "\n".join([
         f"🗓 <b>Дата: {dl}</b>",
         "",
@@ -234,6 +252,8 @@ def format_company_summary(d: Dict[str, Any]) -> str:
         f"🆕 Подали: <b>{c['created']}</b>",
         f"✅ Закрили: <b>{c['closed']}</b>",
         f"📊 Активні на бригадах: <b>{c['active']}</b>",
+        "",
+        f"🛠 Сервісні заявки сьогодні: <b>{s['created_today']}</b>",
         "",
         f"📅 На конкретний день: <b>{c0['exact_day']}</b>",
         f"💭 Думають: <b>{c0['think']}</b>",
