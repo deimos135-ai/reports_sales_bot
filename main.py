@@ -213,12 +213,20 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     }
 
 # ------------------------ Telephony -----------------------
-# ---- Telephony helpers (fallback to old method name) ----
+# ---- Telephony helpers (robust + name resolution) ----
+def _day_bounds_local_str(offset_days: int = 0) -> tuple[str, str]:
+    """Повертає межі доби у локальному часу (Kyiv) у форматі YYYY-MM-DD HH:MM:SS."""
+    now_local = datetime.now(REPORT_TZ)
+    start_local = (now_local - timedelta(days=offset_days)).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = start_local + timedelta(days=1) - timedelta(seconds=1)
+    fmt = "%Y-%m-%d %H:%M:%S"
+    return start_local.strftime(fmt), end_local.strftime(fmt)
+
 async def _telephony_fetch(frm_local: str, to_local: str) -> List[Dict[str, Any]]:
     """
     Повертає записи дзвінків за добу з Bitrix.
-    Спершу пробує telephony.statistic.get, якщо нема — voximplant.statistic.get.
-    Також пробує обидві схеми фільтрів дат: CALL_START_DATE та START_DATE.
+    Спершу telephony.statistic.get, якщо нема — voximplant.statistic.get.
+    Пробує обидві схеми фільтрів дат (CALL_START_DATE / START_DATE).
     """
     methods = ["telephony.statistic.get", "voximplant.statistic.get"]
     date_filters = [
@@ -229,30 +237,79 @@ async def _telephony_fetch(frm_local: str, to_local: str) -> List[Dict[str, Any]
     for method in methods:
         for flt in date_filters:
             try:
-                recs = await b24_list(method, filter=flt, select=["ID","CALL_TYPE","CALL_DURATION","PORTAL_USER_ID"])
+                recs = await b24_list(
+                    method,
+                    filter=flt,
+                    select=[
+                        "ID","CALL_TYPE","CALL_DURATION","CALL_STATUS","CALL_FAILED_CODE",
+                        "PORTAL_USER_ID"
+                    ]
+                )
                 log.info("[telephony] method=%s filters=%s -> %s records", method, list(flt.keys()), len(recs))
                 return recs
             except RuntimeError as e:
                 msg = str(e)
-                # якщо метод відсутній — пробуємо наступний; інші помилки — піднімаємо далі
                 if "ERROR_METHOD_NOT_FOUND" in msg or "Method not found" in msg:
                     last_err = e
-                    break  # інший method
+                    break
                 raise
-    # якщо сюди дійшли — жоден метод не спрацював
     if last_err:
         raise last_err
     return []
+
+# кеш імен співробітників за ID
+_USER_NAME_CACHE: Dict[str, str] = {}
+async def _get_user_name(uid: str) -> str:
+    if not uid:
+        return ""
+    if uid in _USER_NAME_CACHE:
+        return _USER_NAME_CACHE[uid]
+    # 1) з TELEPHONY_OPERATORS (якщо задано в секретах)
+    if uid in TELEPHONY_OPERATORS:
+        _USER_NAME_CACHE[uid] = TELEPHONY_OPERATORS[uid]
+        return _USER_NAME_CACHE[uid]
+    # 2) спроба витягнути з Bitrix user.get
+    try:
+        info = await b24("user.get", ID=int(uid))
+        # user.get повертає список; беремо перший
+        if isinstance(info, list) and info:
+            item = info[0]
+            name = (item.get("NAME") or "").strip()
+            last = (item.get("LAST_NAME") or "").strip()
+            full = " ".join(p for p in [name, last] if p).strip() or (item.get("LOGIN") or "").strip()
+            if full:
+                _USER_NAME_CACHE[uid] = full
+                return full
+    except Exception:
+        pass
+    # 3) фолбек
+    return f"ID {uid}"
+
+def _is_missed_call(rec: Dict[str, Any]) -> bool:
+    """
+    Більш надійне визначення пропущених:
+      - вхідний (CALL_TYPE in {1, INCOMING})
+      - і (duration == 0 або статус з відмовою або є failed_code)
+    """
+    ctype = str(rec.get("CALL_TYPE")).upper()
+    dur = int(rec.get("CALL_DURATION") or 0)
+    status = (rec.get("CALL_STATUS") or "").upper()
+    fcode = str(rec.get("CALL_FAILED_CODE") or "").upper()
+
+    is_incoming = ctype in ("1", "INCOMING")
+    failed_by_status = status in {"NO_ANSWER", "ERROR", "DECLINED", "ABANDONED", "FAILED", "BUSY"}
+    failed_by_code = bool(fcode and fcode not in {"0", "OK"})
+    return is_incoming and (dur == 0 or failed_by_status or failed_by_code)
 
 async def build_telephony_stats(offset_days: int = 0) -> Dict[str, Any]:
     frm_local, to_local = _day_bounds_local_str(offset_days)
     records = await _telephony_fetch(frm_local, to_local)
 
-    total = len(records)
-    incoming = [r for r in records if str(r.get("CALL_TYPE")) in ("1", "INCOMING")]
-    outgoing = [r for r in records if str(r.get("CALL_TYPE")) in ("2", "OUTGOING")]
-    missed = [r for r in incoming if int(r.get("CALL_DURATION") or 0) == 0]
+    # загальні
+    missed_total = sum(1 for r in records if _is_missed_call(r))
+    outgoing = [r for r in records if str(r.get("CALL_TYPE")).upper() in ("2", "OUTGOING")]
 
+    # по операторам — лише вихідні, як ти просив
     per_op: Dict[str, int] = {}
     for r in outgoing:
         uid = str(r.get("PORTAL_USER_ID") or "")
@@ -260,14 +317,18 @@ async def build_telephony_stats(offset_days: int = 0) -> Dict[str, Any]:
             continue
         per_op[uid] = per_op.get(uid, 0) + 1
 
-    log.info("[telephony] got=%s, incoming=%s, outgoing=%s, missed=%s", total, len(incoming), len(outgoing), len(missed))
+    # розвʼязуємо імена
+    per_operator_list = []
+    for uid, cnt in sorted(per_op.items(), key=lambda x: (-x[1], x[0])):
+        name = await _get_user_name(uid)
+        per_operator_list.append({"id": uid, "name": name, "outgoing": cnt})
+
+    log.info("[telephony] totals: missed=%s, outgoing=%s, per_ops=%s",
+             missed_total, len(outgoing), len(per_operator_list))
+
     return {
-        "missed_total": len(missed),
-        "outgoing_total": len(outgoing),
-        "per_operator": [
-            {"id": k, "name": TELEPHONY_OPERATORS.get(k, f'ID {k}'), "outgoing": v}
-            for k, v in sorted(per_op.items(), key=lambda x: (-x[1], x[0]))
-        ],
+        "missed_total": missed_total,
+        "per_operator": per_operator_list,
     }
 
 
@@ -292,16 +353,17 @@ def format_company_summary(d: Dict[str, Any], tel: Optional[Dict[str, Any]]) -> 
         f"📨 Подали сьогодні: <b>{s['created_today']}</b>",
     ]
 
-    if tel is not None:
-        lines += ["", "━━━━━━━━━━━━━━━", "📞 <b>Телефонія</b>", f"🔕 Пропущених: <b>{tel['missed_total']}</b>"]
-        if tel["per_operator"]:
-            lines.append("")
-            lines.append("👥 По операторам (вихідні):")
-            for item in tel["per_operator"]:
-                lines.append(f"• {item['name']}: <b>{item['outgoing']}</b>")
-        lines.append("━━━━━━━━━━━━━━━")
-
+    def format_telephony_block(t: Dict[str, Any]) -> str:
+    lines = [
+        "📞 <b>Телефонія</b>",
+        f"🔕 Пропущених: <b>{t['missed_total']}</b>",
+    ]
+    if t["per_operator"]:
+        lines += ["", "👥 По операторам (вихідні):"]
+        for item in t["per_operator"]:
+            lines.append(f"• {item['name']}: <b>{item['outgoing']}</b>")
     return "\n".join(lines)
+
 
 # ------------------------ Send helpers -------------------
 async def _safe_send(chat_id: int, text: str):
