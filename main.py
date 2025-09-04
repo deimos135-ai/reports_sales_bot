@@ -214,22 +214,26 @@ async def _telephony_fetch(frm_local: str, to_local: str) -> List[Dict[str, Any]
         raise last_err
     return []
 
+# ===== REPLACE the whole _is_missed_call with this =====
 def _is_missed_call(rec: Dict[str, Any]) -> bool:
     """
-    Bitrix UI показує 'Пропущенные' як вхідні без відповіді/помилки.
-    Беремо ширше:
-      - CALL_TYPE in {1,'INCOMING'}
-      - і (CALL_DURATION == 0  або  CALL_STATUS ∈ {NO_ANSWER, ERROR, FAILED, DECLINED, ABANDONED, BUSY}
-         або CALL_FAILED_CODE не порожній/не '0'/'OK')
+    Для вашого порталу:
+      - CALL_TYPE=5 — вхідні; пропущені якщо тривалість 0
+      - CALL_TYPE=1 — інколи теж вхідні; теж вважаємо пропущеним, якщо тривалість 0
+    На CALL_STATUS/FAILED_CODE не спираємось — у логах воно None.
     """
-    ctype = str(rec.get("CALL_TYPE") or "").upper()
-    dur = int(rec.get("CALL_DURATION") or 0)
-    status = str(rec.get("CALL_STATUS") or "").upper()
-    fcode = str(rec.get("CALL_FAILED_CODE") or "").upper()
-    is_incoming = ctype in {"1", "INCOMING"}
-    failed_by_status = status in {"NO_ANSWER", "ERROR", "FAILED", "DECLINED", "ABANDONED", "BUSY"}
-    failed_by_code = (fcode and fcode not in {"0", "OK", "SUCCESS"})
-    return is_incoming and (dur == 0 or failed_by_status or failed_by_code)
+    ctype_raw = rec.get("CALL_TYPE")
+    ctype = str(ctype_raw).upper() if ctype_raw is not None else ""
+    # duration буває '', None — приводимо до int
+    dur_raw = rec.get("CALL_DURATION")
+    try:
+        dur = int(dur_raw or 0)
+    except Exception:
+        dur = 0
+
+    is_incoming_like = ctype in {"5", "INCOMING", "1"}  # 5 — ваш кейс, 1 — запасний
+    return is_incoming_like and dur == 0
+
 
 async def build_telephony_stats(offset_days: int = 0) -> Dict[str, Any]:
     frm_local, to_local = _day_bounds_local_str(offset_days)
@@ -242,6 +246,11 @@ async def build_telephony_stats(offset_days: int = 0) -> Dict[str, Any]:
         types_counter[str(r.get("CALL_TYPE"))] = types_counter.get(str(r.get("CALL_TYPE")),0)+1
         statuses[str(r.get("CALL_STATUS"))] = statuses.get(str(r.get("CALL_STATUS")),0)+1
     log.info("[telephony] types=%s statuses=%s", types_counter, statuses)
+        zero_dur = sum(1 for r in records
+                   if (r.get("CALL_DURATION") or "0") in (0, "0", "", None))
+    log.info("[telephony] zero_duration=%s of %s records", zero_dur, len(records))
+
+    
 
     missed_total = sum(1 for r in records if _is_missed_call(r))
 
