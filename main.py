@@ -1,4 +1,4 @@
-# main.py — Fiber Reports (summary-only) + Telephony via Bitrix (voximplant.statistic.get)
+# main.py — Fiber Reports (summary-only) + robust Telephony via Bitrix
 import asyncio, html, json, logging, os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,7 +24,7 @@ REPORT_TIME = os.environ.get("REPORT_TIME", "19:00")  # HH:MM
 
 REPORT_SUMMARY_CHAT = int(os.environ.get("REPORT_SUMMARY_CHAT", "0"))  # опційно
 
-# Мапа операторів телефонії (з секрету TELEPHONY_OPERATORS як JSON: {"238":"Яна ...", ...})
+# Мапа операторів телефонії (секрет TELEPHONY_OPERATORS як JSON: {"238":"Яна ...", ...})
 _TELEPHONY_OPERATORS_RAW = os.environ.get("TELEPHONY_OPERATORS", "").strip()
 try:
     TELEPHONY_OPERATORS: Dict[str, str] = json.loads(_TELEPHONY_OPERATORS_RAW) if _TELEPHONY_OPERATORS_RAW else {}
@@ -121,6 +121,15 @@ def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str]:
     label = start_local.strftime("%d.%m.%Y")
     return label, start_utc.isoformat(), end_utc.isoformat()
 
+def _day_bounds_local_str(offset_days: int = 0) -> Tuple[str, str, str]:
+    """Локальні рядки для телефонії 'YYYY-MM-DD HH:MM:SS' у REPORT_TZ."""
+    now_local = datetime.now(REPORT_TZ)
+    start_local = (now_local - timedelta(days=offset_days)).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = start_local + timedelta(days=1)
+    label = start_local.strftime("%d.%m.%Y")
+    fmt = "%Y-%m-%d %H:%M:%S"
+    return label, start_local.strftime(fmt), end_local.strftime(fmt)
+
 # ------------------------ CAT0 stage resolving ------------
 _CAT0_STAGES: Optional[Dict[str, str]] = None
 async def _cat0_stages() -> Dict[str, str]:
@@ -159,18 +168,28 @@ def _operator_name_from_uid(uid: Any) -> str:
     s = str(uid)
     return TELEPHONY_OPERATORS.get(s) or f"ID {s}"
 
+def _get_val(d: Dict[str, Any], keys: List[str], default=None):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return default
+
 def _is_missed_incoming(rec: Dict[str, Any]) -> bool:
-    ctype = (rec.get("CALL_TYPE") or "").upper()
-    if ctype != "INCOMING":
+    # Вхідний?
+    ctype = (_get_val(rec, ["CALL_TYPE", "TYPE", "DIRECTION"], "") or "").upper()
+    incoming = ctype in ("INCOMING", "IN")
+    if not incoming:
         return False
-    dur = int(rec.get("CALL_DURATION") or 0)
+    # Нульова тривалість або явна помилка
+    dur = int(_get_val(rec, ["CALL_DURATION", "DURATION"], 0) or 0)
     if dur == 0:
         return True
-    fail = str(rec.get("CALL_FAILED_CODE") or "")
-    return fail not in ("", "200")
+    fail = str(_get_val(rec, ["CALL_FAILED_CODE", "FAILED_CODE", "STATUS_CODE"], "") or "")
+    return fail not in ("", "200", "OK")
 
 def _is_outgoing(rec: Dict[str, Any]) -> bool:
-    return (rec.get("CALL_TYPE") or "").upper() == "OUTGOING"
+    ctype = (_get_val(rec, ["CALL_TYPE", "TYPE", "DIRECTION"], "") or "").upper()
+    return ctype in ("OUTGOING", "OUT")
 
 def _aggregate_telephony(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     missed_total = 0
@@ -180,7 +199,7 @@ def _aggregate_telephony(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         if _is_missed_incoming(r):
             missed_total += 1
         if _is_outgoing(r):
-            uid = r.get("PORTAL_USER_ID") or r.get("USER_ID") or r.get("ACCOUNT_USER_ID")
+            uid = _get_val(r, ["PORTAL_USER_ID", "USER_ID", "ACCOUNT_USER_ID", "PORTAL_USER"], None)
             key = str(uid) if uid is not None else "unknown"
             out_by_operator[key] = out_by_operator.get(key, 0) + 1
 
@@ -192,22 +211,68 @@ def _aggregate_telephony(records: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     return {"missed_total": missed_total, "outgoing_by_operator": pretty_out}
 
-async def fetch_calls_today(frm_iso: str, to_iso: str) -> List[Dict[str, Any]]:
+async def _fetch_calls_via(method: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    res = await b24(method, **params)
+    if isinstance(res, dict):
+        if "items" in res and isinstance(res["items"], list):
+            return res["items"]
+        if "result" in res and isinstance(res["result"], list):
+            return res["result"]
+    if isinstance(res, list):
+        return res
+    return []
+
+async def fetch_calls_today(frm_iso_utc: str, to_iso_utc: str) -> List[Dict[str, Any]]:
     """
-    Тягнемо дзвінки за день з інтеграції Bitrix -> Voximplant.
-    Метод та поля можуть відрізнятись у різних інсталяціях — підлаштовуй за потреби.
+    Витривале отримання статистики дзвінків за сьогодні:
+      1) voximplant.statistic.get з DATE_FROM/DATE_TILL (локальні рядки)
+      2) telephony.statistic.get з DATE_FROM/DATE_TO
+      3) telephony.statistic.get з FILTER { >=CALL_START_DATE, <CALL_START_DATE }
+    Повертає суму унікальних записів, якщо щось повернеться двічі.
     """
+    # локальний часовий інтервал у вигляді рядків
+    _, frm_local, to_local = _day_bounds_local_str(0)  # offset_days підходить той самий
+    out: List[Dict[str, Any]] = []
+
     try:
-        # Найчастіше цей метод повертає {"items":[...], "total":...}
-        res = await b24("voximplant.statistic.get", DATE_FROM=frm_iso, DATE_TILL=to_iso)
-        if isinstance(res, dict) and "items" in res:
-            return res.get("items") or []
-        if isinstance(res, list):
-            return res
-        return []
+        # 1) Voximplant (старий модуль)
+        v1 = await _fetch_calls_via("voximplant.statistic.get", {"DATE_FROM": frm_local, "DATE_TILL": to_local})
+        if v1: out.extend(v1)
     except Exception as e:
-        log.warning("fetch_calls_today error: %s", e)
-        return []
+        log.warning("telephony v1 voximplant.statistic.get failed: %s", e)
+
+    try:
+        # 2) Bitrix телефонія (прості дати)
+        v2 = await _fetch_calls_via("telephony.statistic.get", {"DATE_FROM": frm_local, "DATE_TO": to_local})
+        if v2: out.extend(v2)
+    except Exception as e:
+        log.warning("telephony v2 telephony.statistic.get failed: %s", e)
+
+    try:
+        # 3) Bitrix телефонія через FILTER
+        v3 = await _fetch_calls_via("telephony.statistic.get", {
+            "FILTER": {
+                ">=CALL_START_DATE": frm_local,
+                "<CALL_START_DATE": to_local
+            }
+        })
+        if v3: out.extend(v3)
+    except Exception as e:
+        log.warning("telephony v3 telephony.statistic.get(FILTER) failed: %s", e)
+
+    # Дедуп за ID/SEC_ID/LOG_ID
+    seen = set()
+    uniq = []
+    for r in out:
+        rid = _get_val(r, ["ID", "SEC_ID", "LOG_ID"], None)
+        key = f"{rid}" if rid is not None else json.dumps(r, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(r)
+
+    log.info("[telephony] got %s raw, %s unique", len(out), len(uniq))
+    return uniq
 
 # ------------------------ Summary builder -----------------
 async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
@@ -215,8 +280,7 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     type_map = await get_deal_type_map()
     conn_type_ids = await _connection_type_ids()
 
-    # A) "🆕 Подали сьогодні" (Підключення):
-    #   A1: кат.0, стадія "На конкретний день", TYPE=Підключення, DATE_CREATE у діапазоні
+    # A) Подали сьогодні (Підключення)
     c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
     created_c0_exact = await b24_list(
         "crm.deal.list",
@@ -229,7 +293,6 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
         },
         select=["ID"]
     )
-    #   A2: кат.20, переміщені у будь-яку бригадну стадію сьогодні (DATE_MODIFY), TYPE=Підключення
     created_to_brigades = await b24_list(
         "crm.deal.list",
         order={"DATE_MODIFY": "ASC"},
@@ -243,7 +306,7 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     )
     created_conn = len(created_c0_exact) + len(created_to_brigades)
 
-    # B) "✅ Закрили сьогодні" — по CLOSEDATE, тільки підключення у кат.20, стадія WON
+    # B) Закрили сьогодні (по CLOSEDATE)
     closed_list = await b24_list(
         "crm.deal.list",
         order={"CLOSEDATE": "ASC"},
@@ -257,7 +320,7 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     )
     closed_conn = len(closed_list)
 
-    # C) "📊 Активні на бригадах" — відкриті у бригадних, тип=Підключення
+    # C) Активні на бригадах (відкриті підключення у бригадних стадіях)
     active_open = await b24_list(
         "crm.deal.list",
         order={"ID": "DESC"},
@@ -272,11 +335,11 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     )
     active_conn = len(active_open)
 
-    # D) Категорія 0: відкриті у "На конкретний день" та "Думають"
+    # D) Категорія 0: На конкретний день / Думають
     exact_cnt = await _count_open_in_stage(0, c0_exact_stage, conn_type_ids)
     think_cnt = await _count_open_in_stage(0, c0_think_stage, conn_type_ids)
 
-    # E) Сервісні заявки — «Подали сьогодні»: усі НЕ-підключення, що сьогодні зайшли у бригадні стадії
+    # E) Сервісні заявки (всі НЕ-підключення, що сьогодні зайшли у бригадні стадії)
     service_created_today = await b24_list(
         "crm.deal.list",
         order={"DATE_MODIFY": "ASC"},
@@ -284,19 +347,19 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
             "CATEGORY_ID": 20,
             "STAGE_ID": list(_BRIGADE_STAGE_FULL),
             ">=DATE_MODIFY": frm, "<DATE_MODIFY": to,
-            "!TYPE_ID": conn_type_ids,  # != підключення
+            "!TYPE_ID": conn_type_ids,
         },
         select=["ID"]
     )
     service_created_cnt = len(service_created_today)
 
-    # F) Телефонія
+    # F) Телефонія (битрікс-інтеграція)
     tel_records = await fetch_calls_today(frm, to)
     telephony = _aggregate_telephony(tel_records)
 
-    log.info("[summary] created(today)=%s (c0_exact=%s + to_brigades=%s), closed=%s, active=%s, exact=%s, think=%s, service_today=%s, tel_missed=%s, tel_ops=%s",
-             created_conn, len(created_c0_exact), len(created_to_brigades), closed_conn, active_conn, exact_cnt, think_cnt,
-             service_created_cnt, telephony.get("missed_total"), len(telephony.get("outgoing_by_operator", [])))
+    log.info("[summary] created=%s (c0_exact=%s + to_brig=%s), closed=%s, active=%s, exact=%s, think=%s, service=%s, tel_missed=%s ops=%s",
+             created_conn, len(created_c0_exact), len(created_to_brigades), closed_conn, active_conn,
+             exact_cnt, think_cnt, service_created_cnt, telephony.get("missed_total"), len(telephony.get("outgoing_by_operator", [])))
 
     return {
         "date_label": label,
@@ -384,10 +447,6 @@ async def send_company_summary(offset_days: int = 0) -> None:
 # ------------------------ Manual command -----------------
 @dp.message(Command("report_now"))
 async def report_now(m: Message):
-    """
-    /report_now           — сумарний за сьогодні в цей же чат
-    /report_now 1         — сумарний за вчора в цей же чат
-    """
     parts = (m.text or "").split()
     offset = 0
     if len(parts) >= 2 and parts[1].lstrip("-").isdigit():
