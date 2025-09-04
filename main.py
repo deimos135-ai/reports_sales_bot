@@ -213,35 +213,63 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     }
 
 # ------------------------ Telephony -----------------------
-def _name_for_operator(op_id: str) -> str:
-    return TELEPHONY_OPERATORS.get(str(op_id)) or f"ID {op_id}"
+# ---- Telephony helpers (fallback to old method name) ----
+async def _telephony_fetch(frm_local: str, to_local: str) -> List[Dict[str, Any]]:
+    """
+    Повертає записи дзвінків за добу з Bitrix.
+    Спершу пробує telephony.statistic.get, якщо нема — voximplant.statistic.get.
+    Також пробує обидві схеми фільтрів дат: CALL_START_DATE та START_DATE.
+    """
+    methods = ["telephony.statistic.get", "voximplant.statistic.get"]
+    date_filters = [
+        {">=CALL_START_DATE": frm_local, "<=CALL_START_DATE": to_local},
+        {">=START_DATE": frm_local, "<=START_DATE": to_local},
+    ]
+    last_err = None
+    for method in methods:
+        for flt in date_filters:
+            try:
+                recs = await b24_list(method, filter=flt, select=["ID","CALL_TYPE","CALL_DURATION","PORTAL_USER_ID"])
+                log.info("[telephony] method=%s filters=%s -> %s records", method, list(flt.keys()), len(recs))
+                return recs
+            except RuntimeError as e:
+                msg = str(e)
+                # якщо метод відсутній — пробуємо наступний; інші помилки — піднімаємо далі
+                if "ERROR_METHOD_NOT_FOUND" in msg or "Method not found" in msg:
+                    last_err = e
+                    break  # інший method
+                raise
+    # якщо сюди дійшли — жоден метод не спрацював
+    if last_err:
+        raise last_err
+    return []
 
 async def build_telephony_stats(offset_days: int = 0) -> Dict[str, Any]:
-    # Витягуємо “сирі” логи за добу локального часу → рахуємо самі
     frm_local, to_local = _day_bounds_local_str(offset_days)
-    records = await b24_list(
-        "telephony.statistic.get",
-        filter={">=CALL_START_DATE": frm_local, "<=CALL_START_DATE": to_local},
-        select=["ID","CALL_TYPE","CALL_DURATION","PORTAL_USER_ID"]
-    )
+    records = await _telephony_fetch(frm_local, to_local)
+
     total = len(records)
     incoming = [r for r in records if str(r.get("CALL_TYPE")) in ("1", "INCOMING")]
     outgoing = [r for r in records if str(r.get("CALL_TYPE")) in ("2", "OUTGOING")]
     missed = [r for r in incoming if int(r.get("CALL_DURATION") or 0) == 0]
 
-    # по операторам: рахуємо вихідні (набрані)
     per_op: Dict[str, int] = {}
     for r in outgoing:
         uid = str(r.get("PORTAL_USER_ID") or "")
-        if not uid: continue
+        if not uid:
+            continue
         per_op[uid] = per_op.get(uid, 0) + 1
 
     log.info("[telephony] got=%s, incoming=%s, outgoing=%s, missed=%s", total, len(incoming), len(outgoing), len(missed))
     return {
         "missed_total": len(missed),
         "outgoing_total": len(outgoing),
-        "per_operator": [{"id": k, "name": _name_for_operator(k), "outgoing": v} for k, v in sorted(per_op.items(), key=lambda x: (-x[1], x[0]))],
+        "per_operator": [
+            {"id": k, "name": TELEPHONY_OPERATORS.get(k, f'ID {k}'), "outgoing": v}
+            for k, v in sorted(per_op.items(), key=lambda x: (-x[1], x[0]))
+        ],
     }
+
 
 # ------------------------ Formatting ----------------------
 def format_company_summary(d: Dict[str, Any], tel: Optional[Dict[str, Any]]) -> str:
