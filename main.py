@@ -165,118 +165,135 @@ async def _count_open_in_stage(cat_id: int, stage_full: str, type_ids: Optional[
     return len(deals_fb)
 
 # ------------------------ Telephony (Bitrix REST) --------
-def _name_for_operator(op_id: Any, portal_user_name: Optional[str] = None) -> str:
-    sid = str(op_id) if op_id is not None else ""
-    if sid and sid in TELEPHONY_OPERATORS:
-        return TELEPHONY_OPERATORS[sid]
-    if portal_user_name:
-        return portal_user_name
-    if sid:
-        return f"ID {sid}"
-    return "Невідомо"
+# --- Телефонія (Bitrix telephony.statistic.list) -----------------------------
 
-async def fetch_calls_today(offset_days: int = 0) -> List[Dict[str, Any]]:
-    """
-    Тягнемо всі дзвінки за день з voximplant.statistic.get (повна посторінкова вибірка).
-    """
-    label, frm_iso, to_iso = _day_bounds(offset_days)
-    # Bitrix чекає FILTER з діапазоном CALL_START_DATE
-    calls = await b24_list(
-        "voximplant.statistic.get",
-        page_size=200,
-        throttle=0.1,
-        FILTER={
-            ">=CALL_START_DATE": frm_iso,
-            "<=CALL_START_DATE": to_iso,
-        },
-        # order/select не обов'язкові для цього методу, але хай будуть
-        order={"CALL_START_DATE": "ASC"},
-        select=[
-            "ID","CALL_TYPE","CALL_CATEGORY","CALL_DURATION",
-            "PORTAL_USER_ID","PORTAL_USER_NAME"
-        ],
-    )
-    log.info("[telephony] fetched %s calls for %s", len(calls), label)
-    return calls
+# мапа операторів з ENV (як уже робили)
+_TELEPHONY_OPERATORS_RAW = os.environ.get("TELEPHONY_OPERATORS", "").strip()
+TELEPHONY_OPERATORS: Dict[str, str] = json.loads(_TELEPHONY_OPERATORS_RAW) if _TELEPHONY_OPERATORS_RAW else {}
+VIRTUAL_MANAGER_NAME = "Віртуальний Менеджер"
 
-def _is_incoming(rec: Dict[str, Any]) -> bool:
-    v = str(rec.get("CALL_TYPE", "")).upper()
-    return v in ("2", "INCOMING")
+def _kyiv_day_bounds_strings(offset_days: int = 0) -> Tuple[str, str]:
+    """Повертає строки 'YYYY-MM-DD HH:MM:SS' у часовій зоні Києва для CALL_START_DATE."""
+    now_local = datetime.now(REPORT_TZ)
+    start_local = (now_local - timedelta(days=offset_days)).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = start_local + timedelta(days=1)
+    fmt = "%Y-%m-%d %H:%M:%S"
+    return start_local.strftime(fmt), end_local.strftime(fmt)
 
-def _is_outgoing(rec: Dict[str, Any]) -> bool:
-    v = str(rec.get("CALL_TYPE", "")).upper()
-    return v in ("1", "OUTGOING")
+async def _b24_tel_stat_list(day_from: str, day_to: str) -> List[Dict[str, Any]]:
+    """Витягує ВСІ записи телефонії за діапазон (CALL_START_DATE) з пагінацією."""
+    start = 0
+    page_size = 50
+    items: List[Dict[str, Any]] = []
+    while True:
+        res = await b24(
+            "telephony.statistic.list",
+            FILTER={
+                ">=CALL_START_DATE": day_from,
+                "<CALL_START_DATE": day_to,
+            },
+            ORDER={"CALL_START_DATE": "ASC"},
+            start=start,
+        )
+        chunk = res or []
+        # у деяких порталах результат приходить як {"items":[...], "next":N}
+        if isinstance(chunk, dict):
+            items.extend(chunk.get("items", []))
+            nxt = chunk.get("next")
+            if nxt is None:
+                break
+            start = nxt
+        else:
+            items.extend(chunk)
+            if len(chunk) < page_size:
+                break
+            start += page_size
+    return items
 
-def _is_missed(rec: Dict[str, Any]) -> bool:
-    # Надійний критерій: категорія 'missed' АБО (вхідний і тривалість == 0)
-    cat = str(rec.get("CALL_CATEGORY", "")).lower()
-    if cat == "missed":
-        return True
-    try:
-        dur = int(rec.get("CALL_DURATION") or 0)
-    except Exception:
-        dur = 0
-    return _is_incoming(rec) and dur == 0
+def _name_for_uid(uid: Optional[int]) -> str:
+    if uid is None or int(uid) <= 0:
+        return VIRTUAL_MANAGER_NAME
+    return TELEPHONY_OPERATORS.get(str(uid), f"ID {uid}")
 
-def _is_answered_incoming(rec: Dict[str, Any]) -> bool:
-    if not _is_incoming(rec):
+def _is_incoming(row: Dict[str, Any]) -> bool:
+    # CALL_TYPE: 1=incoming, 2=outgoing, 3=callback
+    return int(row.get("CALL_TYPE", 0)) == 1
+
+def _is_outgoing(row: Dict[str, Any]) -> bool:
+    return int(row.get("CALL_TYPE", 0)) == 2
+
+def _answered(row: Dict[str, Any]) -> bool:
+    # Найнадійніше — CALL_DURATION > 0 або CALL_STATUS == 200
+    dur = int(row.get("CALL_DURATION", 0) or 0)
+    st = int(row.get("CALL_STATUS", 0) or 0)
+    return dur > 0 or st == 200
+
+def _missed(row: Dict[str, Any]) -> bool:
+    # Вхідні, не прийняті (duration==0 або статус не 200)
+    if not _is_incoming(row):
         return False
-    try:
-        dur = int(rec.get("CALL_DURATION") or 0)
-    except Exception:
-        dur = 0
-    cat = str(rec.get("CALL_CATEGORY", "")).lower()
-    return dur > 0 and cat != "missed"
+    return not _answered(row)
 
-def aggregate_telephony(calls: List[Dict[str, Any]]) -> Dict[str, Any]:
-    total_missed = 0
-    total_in_answered = 0
-    total_out = 0
+async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
+    day_from, day_to = _kyiv_day_bounds_strings(offset_days)
+    rows = await _b24_tel_stat_list(day_from, day_to)
+    log.info("[telephony] fetched %s calls for %s..%s", len(rows), day_from, day_to)
 
-    per_in: Dict[str, int] = {}   # по операторам — вхідні прийняті
-    per_out: Dict[str, int] = {}  # по операторам — вихідні
+    missed = 0
+    incoming_answered = 0
+    outgoing_total = 0
 
-    for r in calls:
-        op_id = r.get("PORTAL_USER_ID")
-        op_name = _name_for_operator(op_id, r.get("PORTAL_USER_NAME"))
-        if _is_missed(r):
-            total_missed += 1
-        if _is_answered_incoming(r):
-            total_in_answered += 1
-            per_in[op_name] = per_in.get(op_name, 0) + 1
-        if _is_outgoing(r):
-            total_out += 1
-            per_out[op_name] = per_out.get(op_name, 0) + 1
+    # Розбивки по операторам
+    per_op_incoming: Dict[str, int] = {}
+    per_op_outgoing: Dict[str, int] = {}
+
+    for r in rows:
+        uid_raw = r.get("PORTAL_USER_ID")
+        # Bitrix інколи віддає строку
+        uid = int(uid_raw) if str(uid_raw).strip() not in ("", "None", "null") else 0
+        op_name = _name_for_uid(uid)
+
+        if _is_incoming(r):
+            if _missed(r):
+                missed += 1
+                # пропущені не кладемо в «вхідні (прийняті)»
+            else:
+                incoming_answered += 1
+                per_op_incoming[op_name] = per_op_incoming.get(op_name, 0) + 1
+
+        elif _is_outgoing(r):
+            outgoing_total += 1
+            per_op_outgoing[op_name] = per_op_outgoing.get(op_name, 0) + 1
+
+        # інші типи (callback) ігноруємо або додай окремо, якщо потрібно
 
     return {
-        "missed": total_missed,
-        "incoming_answered": total_in_answered,
-        "outgoing": total_out,
-        "per_in": per_in,
-        "per_out": per_out,
+        "missed": missed,
+        "incoming_ok": incoming_answered,
+        "outgoing": outgoing_total,
+        "per_op_in": dict(sorted(per_op_incoming.items(), key=lambda x: (-x[1], x[0]))),
+        "per_op_out": dict(sorted(per_op_outgoing.items(), key=lambda x: (-x[1], x[0]))),
     }
 
-def format_telephony(date_label: str, t: Dict[str, Any]) -> str:
+def format_telephony_block(t: Dict[str, Any]) -> str:
     lines = [
-        "━━━━━━━━━━━━━━━",
         "📞 <b>Телефонія</b>",
         f"🔕 Пропущених: <b>{t['missed']}</b>",
-        f"📥 Вхідних (прийнятих): <b>{t['incoming_answered']}</b>",
+        f"📥 Вхідних (прийнятих): <b>{t['incoming_ok']}</b>",
         f"📤 Вихідних: <b>{t['outgoing']}</b>",
+        "",
     ]
-    if t["per_in"]:
-        lines.append("")
-        lines.append("👥 <b>По операторам (вхідні)</b>:")
-        # відсортуємо за спаданням
-        for name, cnt in sorted(t["per_in"].items(), key=lambda x: x[1], reverse=True):
+    if t["per_op_in"]:
+        lines.append("👥 По операторам (вхідні):")
+        for name, cnt in list(t["per_op_in"].items()):
             lines.append(f"• {name}: {cnt}")
-    if t["per_out"]:
         lines.append("")
-        lines.append("👥 <b>По операторам (вихідні)</b>:")
-        for name, cnt in sorted(t["per_out"].items(), key=lambda x: x[1], reverse=True):
+    if t["per_op_out"]:
+        lines.append("👥 По операторам (вихідні):")
+        for name, cnt in list(t["per_op_out"].items()):
             lines.append(f"• {name}: {cnt}")
-    lines.append("━━━━━━━━━━━━━━━")
-    return "\n".join(lines)
+    return "\n".join(lines).rstrip()
+
 
 # ------------------------ Summary builder -----------------
 async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
