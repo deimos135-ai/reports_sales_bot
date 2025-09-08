@@ -25,7 +25,7 @@ REPORT_TIME = os.environ.get("REPORT_TIME", "19:00")  # HH:MM
 
 REPORT_SUMMARY_CHAT = int(os.environ.get("REPORT_SUMMARY_CHAT", "0"))  # optional
 
-# <<< NEW: налаштування підрахунку вихідних
+# Лічильник вихідних
 OUTGOING_COUNT_MODE = os.environ.get("OUTGOING_COUNT_MODE", "connected_unique").lower()
 # 'all' | 'connected' | 'connected_unique'
 OUTGOING_MIN_SEC = int(os.environ.get("OUTGOING_MIN_SEC", "10"))
@@ -194,27 +194,30 @@ def _operator_name(pid: Any) -> str:
     sid = str(pid)
     return OP_NAME.get(sid) or f"ID {sid}"
 
-_INBOUND_CATS = {"callback", "calltracking", "ivr", "queue", "sip"}
-_OUTBOUND_CATS = {"external"}
+_INBOUND_CATS = {"callback", "calltracking", "ivr", "queue", "sip"}  # те, що точно вхідне
+_OUTBOUND_CATS = {"external"}  # явний вихідний
 
 def _incoming_outgoing_flags(r: Dict[str, Any]) -> Tuple[bool, bool]:
+    """
+    Пріоритет: CALL_CATEGORY -> PORTAL_NUMBER -> CALL_TYPE
+    """
     cat = str(r.get("CALL_CATEGORY") or "").strip().lower()
-    ct = r.get("CALL_TYPE")
-    portal_num = str(r.get("PORTAL_NUMBER") or "")
+    if cat in _OUTBOUND_CATS:
+        return False, True
+    if cat in _INBOUND_CATS and cat != "":
+        return True, False
 
+    portal_num = str(r.get("PORTAL_NUMBER") or "")
+    if portal_num.startswith("REST_APP:"):
+        # інтеграції типу Asterisk частіше = вихідні
+        return False, True
+
+    ct = r.get("CALL_TYPE")
     if isinstance(ct, int):
-        if ct == 1 and cat not in _OUTBOUND_CATS:
+        if ct == 1:
             return True, False
         if ct == 2:
             return False, True
-
-    if cat in _INBOUND_CATS:
-        return True, False
-    if cat in _OUTBOUND_CATS:
-        return False, True
-
-    if portal_num.startswith("REST_APP:"):
-        return False, True
 
     return False, False
 
@@ -223,15 +226,15 @@ def _is_missed_incoming(r: Dict[str, Any]) -> bool:
     if not is_in:
         return False
     dur = int(r.get("CALL_DURATION") or r.get("DURATION") or 0)
-    failed = str(r.get("CALL_FAILED_CODE") or "").strip()
-    return dur == 0 or failed != ""
+    code = str(r.get("CALL_FAILED_CODE") or "").strip()
+    # пропущений: 0 сек або код помилки відмінний від "200"/порожнього
+    return dur == 0 or (code not in ("", "200"))
 
-# <<< NEW: успішність вихідного
 def _is_success_outgoing(r: Dict[str, Any]) -> bool:
+    # Успіх тільки при явному 200 і пороговій тривалості
     dur = int(r.get("CALL_DURATION") or r.get("DURATION") or 0)
     code = str(r.get("CALL_FAILED_CODE") or "").strip()
-    # Bitrix для успіху зазвичай '200', інколи порожньо
-    return (code == "" or code == "200") and dur >= OUTGOING_MIN_SEC
+    return code == "200" and dur >= OUTGOING_MIN_SEC
 
 async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
     label, _, _, start_local_iso, end_local_iso = _day_bounds(offset_days)
@@ -250,9 +253,9 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
     missed_total = 0
     incoming_answered_total = 0
 
-    outgoing_all_total = 0               # усі outbound (для довідки)
-    outgoing_connected_total = 0         # лише успішні (поріг часу)
-    outgoing_connected_unique_total = 0  # успішні + унікалізація по номеру
+    outgoing_all_total = 0
+    outgoing_connected_total = 0
+    outgoing_connected_unique_total = 0
 
     per_incoming_by_op: DefaultDict[str, int] = defaultdict(int)
     per_outgoing_all_by_op: DefaultDict[str, int] = defaultdict(int)
@@ -260,7 +263,6 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
     per_outgoing_connected_unique_by_op: DefaultDict[str, int] = defaultdict(int)
     per_handled_by_op: DefaultDict[str, int] = defaultdict(int)
 
-    # множини для унікалізації успішних вихідних по оператору
     seen_out_unique: DefaultDict[str, Set[str]] = defaultdict(set)
 
     while True:
@@ -275,11 +277,8 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
             phone = str(r.get("PHONE_NUMBER") or "").strip()
 
             is_in, is_out = _incoming_outgoing_flags(r)
-            is_missed = _is_missed_incoming(r)
-            is_out_success = _is_success_outgoing(r)
-
             if is_in:
-                if is_missed:
+                if _is_missed_incoming(r):
                     missed_total += 1
                 else:
                     incoming_answered_total += 1
@@ -289,15 +288,14 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
             if is_out:
                 outgoing_all_total += 1
                 per_outgoing_all_by_op[name] += 1
-                if is_out_success:
+                if _is_success_outgoing(r):
                     outgoing_connected_total += 1
                     per_outgoing_connected_by_op[name] += 1
-                    # унікалізація по номеру (на оператора)
                     if phone and phone not in seen_out_unique[name]:
                         seen_out_unique[name].add(phone)
                         outgoing_connected_unique_total += 1
                         per_outgoing_connected_unique_by_op[name] += 1
-                    per_handled_by_op[name] += 1  # “опрацьовано” рахуємо лише успішні out + прийняті in
+                    per_handled_by_op[name] += 1
 
         fetched += len(rows)
         nxt = data.get("next")
@@ -306,13 +304,14 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
         start = nxt
         await asyncio.sleep(0.1)
 
-    log.info("[telephony] %s: fetched=%s total=%s pages=%s, out_all=%s, out_conn=%s, out_conn_unique=%s",
-             label, fetched, total, pages, outgoing_all_total, outgoing_connected_total, outgoing_connected_unique_total)
+    log.info("[telephony] %s: fetched=%s total=%s pages=%s; missed=%s; in_ans=%s; out_all=%s; out_ok=%s; out_ok_unique=%s",
+             label, fetched, total, pages, missed_total, incoming_answered_total,
+             outgoing_all_total, outgoing_connected_total, outgoing_connected_unique_total)
 
     def _sorted_items(d: Dict[str, int]) -> List[Tuple[str, int]]:
         return sorted(d.items(), key=lambda x: (-x[1], x[0]))
 
-    # Вибір вихідних для показу згідно режиму
+    # Вивід вихідних за режимом
     if OUTGOING_COUNT_MODE == "connected":
         outgoing_total = outgoing_connected_total
         outgoing_by_op = per_outgoing_connected_by_op
@@ -327,14 +326,20 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
         outgoing_label = "📤 Вихідних (усі)"
 
     return {
-        "meta": {"fetched": fetched, "total": (total or fetched), "pages": pages,
-                 "mode": OUTGOING_COUNT_MODE, "min_sec": OUTGOING_MIN_SEC,
-                 "out_all": outgoing_all_total, "out_connected": outgoing_connected_total,
-                 "out_connected_unique": outgoing_connected_unique_total},
+        "meta": {
+            "fetched": fetched,
+            "total": (total or fetched),
+            "pages": pages,
+            "mode": OUTGOING_COUNT_MODE,
+            "min_sec": OUTGOING_MIN_SEC,
+            "out_all": outgoing_all_total,
+            "out_connected": outgoing_connected_total,
+            "out_connected_unique": outgoing_connected_unique_total
+        },
         "missed_total": missed_total,
         "incoming_answered_total": incoming_answered_total,
         "outgoing_total": outgoing_total,
-        "outgoing_label": outgoing_label,  # <<< NEW: щоб у форматері не гадати підпис
+        "outgoing_label": outgoing_label,
         "incoming_by_operator": _sorted_items(per_incoming_by_op),
         "outgoing_by_operator": _sorted_items(outgoing_by_op),
         "handled_by_operator": _sorted_items(per_handled_by_op),
@@ -350,7 +355,7 @@ def format_telephony_summary(t: Dict[str, Any]) -> str:
         )
     lines.append(f"🔕 Пропущених: <b>{t['missed_total']}</b>")
     lines.append(f"📥 Вхідних (прийнятих): <b>{t['incoming_answered_total']}</b>")
-    lines.append(f"{t['outgoing_label']}: <b>{t['outgoing_total']}</b>")  # <<< NEW
+    lines.append(f"{t['outgoing_label']}: <b>{t['outgoing_total']}</b>")
     lines.append("")
 
     if t["handled_by_operator"]:
@@ -366,7 +371,9 @@ def format_telephony_summary(t: Dict[str, Any]) -> str:
         lines.append("")
 
     if t["outgoing_by_operator"]:
-        lines.append(f"👥 По операторам — <i>{t['outgoing_label'][2:]}</i>:")  # прибираємо піктограму
+        # прибираємо піктограму з підпису
+        label_clean = t["outgoing_label"].split(" ", 1)[-1]
+        lines.append(f"👥 По операторам — <i>{label_clean}</i>:")
         for name, cnt in t["outgoing_by_operator"]:
             lines.append(f"• {name}: <b>{cnt}</b>")
         lines.append("")
@@ -377,7 +384,7 @@ def format_telephony_summary(t: Dict[str, Any]) -> str:
 # ------------------------ Summary builder -----------------
 async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     label, frm_utc, to_utc, _, _ = _day_bounds(offset_days)
-    type_map = await get_deal_type_map()
+    _ = await get_deal_type_map()
     conn_type_ids = await _connection_type_ids()
 
     c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
