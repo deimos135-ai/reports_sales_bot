@@ -25,11 +25,6 @@ REPORT_TIME = os.environ.get("REPORT_TIME", "19:00")  # HH:MM
 
 REPORT_SUMMARY_CHAT = int(os.environ.get("REPORT_SUMMARY_CHAT", "0"))  # optional
 
-# Лічильник вихідних
-OUTGOING_COUNT_MODE = os.environ.get("OUTGOING_COUNT_MODE", "connected_unique").lower()
-# 'all' | 'connected' | 'connected_unique'
-OUTGOING_MIN_SEC = int(os.environ.get("OUTGOING_MIN_SEC", "10"))
-
 # Довідник операторів
 _TELEPHONY_OPERATORS_RAW = os.environ.get("TELEPHONY_OPERATORS", "")
 try:
@@ -66,7 +61,10 @@ async def healthz():
 async def _sleep_backoff(attempt: int, base: float = 0.5, cap: float = 8.0):
     await asyncio.sleep(min(cap, base * (2 ** attempt)))
 
-async def b24(method: str, **params) -> Any:
+async def b24_raw(method: str, **params) -> Dict[str, Any]:
+    """
+    Повертає СИРИЙ JSON Bitrix без обрізання 'next/total'.
+    """
     url = f"{BITRIX_WEBHOOK_BASE}/{method}.json"
     for attempt in range(6):
         try:
@@ -78,31 +76,21 @@ async def b24(method: str, **params) -> Any:
                         log.warning("Bitrix temp error: %s (%s), retry #%s", err, desc, attempt+1)
                         await _sleep_backoff(attempt); continue
                     raise RuntimeError(f"B24 error: {err}: {desc}")
-                return data.get("result")
+                return data
         except aiohttp.ClientError as e:
             log.warning("Bitrix network error: %s, retry #%s", e, attempt+1)
             await _sleep_backoff(attempt)
     raise RuntimeError("Bitrix request failed after retries")
 
-async def b24_vox_page(**params) -> Dict[str, Any]:
-    url = f"{BITRIX_WEBHOOK_BASE}/voximplant.statistic.get.json"
-    for attempt in range(6):
-        try:
-            async with HTTP.post(url, json=params) as resp:
-                data = await resp.json()
-                if "error" in data:
-                    err = data["error"]; desc = data.get("error_description")
-                    if err in ("QUERY_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS", "INTERNAL_SERVER_ERROR"):
-                        log.warning("Bitrix temp error (vox): %s (%s), retry #%s", err, desc, attempt+1)
-                        await _sleep_backoff(attempt); continue
-                    raise RuntimeError(f"B24 error (vox): {err}: {desc}")
-                return data
-        except aiohttp.ClientError as e:
-            log.warning("Bitrix network error (vox): %s, retry #%s", e, attempt+1)
-            await _sleep_backoff(attempt)
-    raise RuntimeError("Bitrix vox request failed after retries")
+async def b24(method: str, **params) -> Any:
+    data = await b24_raw(method, **params)
+    return data.get("result")
 
 async def b24_list(method: str, *, page_size: int = 200, throttle: float = 0.12, **params) -> List[Dict[str, Any]]:
+    """
+    Узагальнене пагінування для більшості методів (crm.deal.list тощо), які розуміють 'start'.
+    Для voximplant використовуємо окремий пагінатор, бо треба total/next.
+    """
     start = 0
     out: List[Dict[str, Any]] = []
     while True:
@@ -115,6 +103,30 @@ async def b24_list(method: str, *, page_size: int = 200, throttle: float = 0.12,
         start += page_size
         if throttle: await asyncio.sleep(throttle)
     return out
+
+async def b24_voxi_paged(filter: Dict[str, Any], select: List[str], *, page_size: int = 200, throttle: float = 0.12):
+    """
+    Спеціальний пагінатор для voximplant.statistic.get з підрахунком total/next/сторінок.
+    Повертає (rows, meta) де meta = {'total': int, 'fetched': int, 'pages': int}.
+    """
+    start = 0
+    fetched = 0
+    pages = 0
+    rows: List[Dict[str, Any]] = []
+    while True:
+        payload = {"filter": filter, "select": select, "start": start}
+        data = await b24_raw("voximplant.statistic.get", **payload)
+        result = data.get("result") or []
+        total = int(data.get("total") or 0)
+        nxt = data.get("next", None)
+        rows.extend(result)
+        fetched += len(result)
+        pages += 1
+        log.debug("[voxi] page #%s fetched %s (start=%s, next=%s, total=%s)", pages, len(result), start, nxt, total)
+        if nxt is None:
+            return rows, {"total": total or fetched, "fetched": fetched, "pages": pages}
+        start = int(nxt)
+        if throttle: await asyncio.sleep(throttle)
 
 # ------------------------ Caches / mappings ---------------
 _DEAL_TYPE_MAP: Optional[Dict[str, str]] = None
@@ -130,11 +142,7 @@ def _is_connection(type_id: str, type_name: Optional[str] = None) -> bool:
     name = (type_name or "").strip().lower()
     if not name and _DEAL_TYPE_MAP:
         name = (_DEAL_TYPE_MAP.get(type_id, "") or "").strip().lower()
-    return (
-        name in ("підключення", "подключение")
-        or ("підключ" in name)
-        or ("подключ" in name)
-    )
+    return (name in ("підключення", "подключение")) or ("підключ" in name) or ("подключ" in name)
 
 async def _connection_type_ids() -> List[str]:
     m = await get_deal_type_map()
@@ -188,218 +196,151 @@ async def _count_open_in_stage(cat_id: int, stage_full: str, type_ids: Optional[
     return len(deals_fb)
 
 # ------------------------ Telephony (Bitrix) --------------
+def _is_incoming(r: Dict[str, Any]) -> bool:
+    ct = r.get("CALL_TYPE")
+    if isinstance(ct, int):
+        return ct == 1
+    cat = (r.get("CALL_CATEGORY") or "").lower()
+    return cat in {"external", "callback"} and (ct is None)  # фолбек
+
+def _is_outgoing(r: Dict[str, Any]) -> bool:
+    ct = r.get("CALL_TYPE")
+    if isinstance(ct, int):
+        return ct == 2
+    cat = (r.get("CALL_CATEGORY") or "").lower()
+    return cat in {"outgoing"}
+
+def _is_missed(r: Dict[str, Any]) -> bool:
+    if not _is_incoming(r):
+        return False
+    dur = int(r.get("CALL_DURATION") or r.get("DURATION") or 0)
+    failed = str(r.get("CALL_FAILED_CODE") or "").strip()
+    return (failed != "") or (dur == 0)
+
 def _operator_name(pid: Any) -> str:
     if pid is None:
         return "Невідомий оператор"
     sid = str(pid)
     return OP_NAME.get(sid) or f"ID {sid}"
 
-_INBOUND_CATS = {"callback", "calltracking", "ivr", "queue", "sip"}  # те, що точно вхідне
-_OUTBOUND_CATS = {"external"}  # явний вихідний
-
-def _incoming_outgoing_flags(r: Dict[str, Any]) -> Tuple[bool, bool]:
-    """
-    Пріоритет: CALL_CATEGORY -> PORTAL_NUMBER -> CALL_TYPE
-    """
-    cat = str(r.get("CALL_CATEGORY") or "").strip().lower()
-    if cat in _OUTBOUND_CATS:
-        return False, True
-    if cat in _INBOUND_CATS and cat != "":
-        return True, False
-
-    portal_num = str(r.get("PORTAL_NUMBER") or "")
-    if portal_num.startswith("REST_APP:"):
-        # інтеграції типу Asterisk частіше = вихідні
-        return False, True
-
-    ct = r.get("CALL_TYPE")
-    if isinstance(ct, int):
-        if ct == 1:
-            return True, False
-        if ct == 2:
-            return False, True
-
-    return False, False
-
-def _is_missed_incoming(r: Dict[str, Any]) -> bool:
-    is_in, _ = _incoming_outgoing_flags(r)
-    if not is_in:
-        return False
-    dur = int(r.get("CALL_DURATION") or r.get("DURATION") or 0)
-    code = str(r.get("CALL_FAILED_CODE") or "").strip()
-    # пропущений: 0 сек або код помилки відмінний від "200"/порожнього
-    return dur == 0 or (code not in ("", "200"))
-
 def _is_success_outgoing(r: Dict[str, Any]) -> bool:
-    # Успіх тільки при явному 200 і пороговій тривалості
-    dur = int(r.get("CALL_DURATION") or r.get("DURATION") or 0)
+    if not _is_outgoing(r):
+        return False
     code = str(r.get("CALL_FAILED_CODE") or "").strip()
-    return code == "200" and dur >= OUTGOING_MIN_SEC
+    if code != "200":
+        return False
+    dur = int(r.get("CALL_DURATION") or 0)
+    return dur >= 10
 
 async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
     label, _, _, start_local_iso, end_local_iso = _day_bounds(offset_days)
-
     select = [
-        "CALL_START_DATE", "CALL_DURATION", "CALL_FAILED_CODE",
-        "CALL_TYPE", "CALL_CATEGORY", "PORTAL_USER_ID", "PORTAL_NUMBER", "PHONE_NUMBER"
+        "CALL_START_DATE","CALL_DURATION","CALL_FAILED_CODE",
+        "CALL_TYPE","CALL_CATEGORY","PORTAL_USER_ID","PHONE_NUMBER"
     ]
     flt = {">=CALL_START_DATE": start_local_iso, "<CALL_START_DATE": end_local_iso}
 
-    start = 0
-    total = None
-    fetched = 0
-    pages = 0
+    rows, meta = await b24_voxi_paged(flt, select, page_size=200, throttle=0.08)
+    log.info("[telephony] fetched %s / %s rows in %s pages for %s", meta["fetched"], meta["total"], meta["pages"], label)
 
     missed_total = 0
     incoming_answered_total = 0
-
-    outgoing_all_total = 0
-    outgoing_connected_total = 0
-    outgoing_connected_unique_total = 0
+    outgoing_total_success = 0
 
     per_incoming_by_op: DefaultDict[str, int] = defaultdict(int)
-    per_outgoing_all_by_op: DefaultDict[str, int] = defaultdict(int)
-    per_outgoing_connected_by_op: DefaultDict[str, int] = defaultdict(int)
-    per_outgoing_connected_unique_by_op: DefaultDict[str, int] = defaultdict(int)
-    per_handled_by_op: DefaultDict[str, int] = defaultdict(int)
+    per_outgoing_by_op: DefaultDict[str, int] = defaultdict(int)
+    per_processed_by_op: DefaultDict[str, int] = defaultdict(int)
 
-    seen_out_unique: DefaultDict[str, Set[str]] = defaultdict(set)
+    # для унікальності вихідних по номеру на оператора
+    unique_out_calls: Dict[str, Set[str]] = defaultdict(set)  # op_name -> set(phone)
 
-    while True:
-        data = await b24_vox_page(filter=flt, select=select, start=start)
-        rows = data.get("result", []) or []
-        total = data.get("total", total)
-        pages += 1
+    for r in rows:
+        pid = r.get("PORTAL_USER_ID")
+        name = _operator_name(pid)
 
-        for r in rows:
-            pid = r.get("PORTAL_USER_ID")
-            name = _operator_name(pid)
+        if _is_missed(r):
+            missed_total += 1
+
+        if _is_incoming(r) and not _is_missed(r):
+            incoming_answered_total += 1
+            per_incoming_by_op[name] += 1
+            per_processed_by_op[name] += 1
+
+        if _is_success_outgoing(r):
             phone = str(r.get("PHONE_NUMBER") or "").strip()
-
-            is_in, is_out = _incoming_outgoing_flags(r)
-            if is_in:
-                if _is_missed_incoming(r):
-                    missed_total += 1
-                else:
-                    incoming_answered_total += 1
-                    per_incoming_by_op[name] += 1
-                    per_handled_by_op[name] += 1
-
-            if is_out:
-                outgoing_all_total += 1
-                per_outgoing_all_by_op[name] += 1
-                if _is_success_outgoing(r):
-                    outgoing_connected_total += 1
-                    per_outgoing_connected_by_op[name] += 1
-                    if phone and phone not in seen_out_unique[name]:
-                        seen_out_unique[name].add(phone)
-                        outgoing_connected_unique_total += 1
-                        per_outgoing_connected_unique_by_op[name] += 1
-                    per_handled_by_op[name] += 1
-
-        fetched += len(rows)
-        nxt = data.get("next")
-        if nxt is None:
-            break
-        start = nxt
-        await asyncio.sleep(0.1)
-
-    log.info("[telephony] %s: fetched=%s total=%s pages=%s; missed=%s; in_ans=%s; out_all=%s; out_ok=%s; out_ok_unique=%s",
-             label, fetched, total, pages, missed_total, incoming_answered_total,
-             outgoing_all_total, outgoing_connected_total, outgoing_connected_unique_total)
+            if phone and phone not in unique_out_calls[name]:
+                unique_out_calls[name].add(phone)
+                per_outgoing_by_op[name] += 1
+                per_processed_by_op[name] += 1
+                outgoing_total_success += 1
 
     def _sorted_items(d: Dict[str, int]) -> List[Tuple[str, int]]:
         return sorted(d.items(), key=lambda x: (-x[1], x[0]))
 
-    # Вивід вихідних за режимом
-    if OUTGOING_COUNT_MODE == "connected":
-        outgoing_total = outgoing_connected_total
-        outgoing_by_op = per_outgoing_connected_by_op
-        outgoing_label = f"📤 Вихідних (успішних, ≥{OUTGOING_MIN_SEC}s)"
-    elif OUTGOING_COUNT_MODE == "connected_unique":
-        outgoing_total = outgoing_connected_unique_total
-        outgoing_by_op = per_outgoing_connected_unique_by_op
-        outgoing_label = f"📤 Вихідних (успішних, унік. номер, ≥{OUTGOING_MIN_SEC}s)"
-    else:
-        outgoing_total = outgoing_all_total
-        outgoing_by_op = per_outgoing_all_by_op
-        outgoing_label = "📤 Вихідних (усі)"
-
     return {
-        "meta": {
-            "fetched": fetched,
-            "total": (total or fetched),
-            "pages": pages,
-            "mode": OUTGOING_COUNT_MODE,
-            "min_sec": OUTGOING_MIN_SEC,
-            "out_all": outgoing_all_total,
-            "out_connected": outgoing_connected_total,
-            "out_connected_unique": outgoing_connected_unique_total
-        },
+        "meta": meta,  # total/fetched/pages
         "missed_total": missed_total,
         "incoming_answered_total": incoming_answered_total,
-        "outgoing_total": outgoing_total,
-        "outgoing_label": outgoing_label,
+        "outgoing_total_success": outgoing_total_success,
         "incoming_by_operator": _sorted_items(per_incoming_by_op),
-        "outgoing_by_operator": _sorted_items(outgoing_by_op),
-        "handled_by_operator": _sorted_items(per_handled_by_op),
+        "outgoing_by_operator": _sorted_items(per_outgoing_by_op),
+        "processed_by_operator": _sorted_items(per_processed_by_op),
     }
 
 def format_telephony_summary(t: Dict[str, Any]) -> str:
+    m = t["meta"]
     lines = []
     lines.append("📞 <b>Телефонія</b>")
-    meta = t.get("meta", {})
-    if meta:
-        lines.append(
-            f"🧾 Записів (за день): <b>{meta.get('fetched', 0)}</b> / <b>{meta.get('total', 0)}</b> · сторінок: <b>{meta.get('pages', 1)}</b>"
-        )
+    lines.append(f"🧾 Записів (за день): <b>{m['fetched']}</b> / <b>{m['total']}</b> · сторінок: <b>{m['pages']}</b>")
     lines.append(f"🔕 Пропущених: <b>{t['missed_total']}</b>")
     lines.append(f"📥 Вхідних (прийнятих): <b>{t['incoming_answered_total']}</b>")
-    lines.append(f"{t['outgoing_label']}: <b>{t['outgoing_total']}</b>")
+    lines.append(f"📤 Вихідних (успішних, унік. номер, ≥10s): <b>{t['outgoing_total_success']}</b>")
     lines.append("")
-
-    if t["handled_by_operator"]:
-        lines.append("👥 <b>Опрацьовано:</b> <i>вхідні (прийняті) + вихідні (успішні)</i>")
-        for name, cnt in t["handled_by_operator"]:
+    if t["processed_by_operator"]:
+        lines.append("👥 Опрацьовано: вхідні (прийняті) + вихідні (успішні)")
+        for name, cnt in t["processed_by_operator"]:
             lines.append(f"• {name}: <b>{cnt}</b>")
         lines.append("")
-
-    if t["incoming_by_operator"]:
-        lines.append("👥 По операторам — <i>вхідні (прийняті)</i>:")
-        for name, cnt in t["incoming_by_operator"]:
-            lines.append(f"• {name}: <b>{cnt}</b>")
-        lines.append("")
-
     if t["outgoing_by_operator"]:
-        # прибираємо піктограму з підпису
-        label_clean = t["outgoing_label"].split(" ", 1)[-1]
-        lines.append(f"👥 По операторам — <i>{label_clean}</i>:")
+        lines.append("👥 По операторам — Вихідних (успішних, унік. номер, ≥10s):")
         for name, cnt in t["outgoing_by_operator"]:
             lines.append(f"• {name}: <b>{cnt}</b>")
         lines.append("")
-
+    if t["incoming_by_operator"]:
+        lines.append("👥 По операторам — Вхідних (прийнятих):")
+        for name, cnt in t["incoming_by_operator"]:
+            lines.append(f"• {name}: <b>{cnt}</b>")
+        lines.append("")
     lines.append("━━━━━━━━━━━━━━━")
     return "\n".join(lines)
 
 # ------------------------ Summary builder -----------------
 async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     label, frm_utc, to_utc, _, _ = _day_bounds(offset_days)
-    _ = await get_deal_type_map()
+    type_map = await get_deal_type_map()
     conn_type_ids = await _connection_type_ids()
 
     c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
     created_c0_exact = await b24_list(
         "crm.deal.list",
         order={"ID": "DESC"},
-        filter={"CATEGORY_ID": 0, "STAGE_ID": c0_exact_stage, "TYPE_ID": conn_type_ids,
-                ">=DATE_CREATE": frm_utc, "<DATE_CREATE": to_utc},
+        filter={
+            "CATEGORY_ID": 0,
+            "STAGE_ID": c0_exact_stage,
+            "TYPE_ID": conn_type_ids,
+            ">=DATE_CREATE": frm_utc, "<DATE_CREATE": to_utc,
+        },
         select=["ID"]
     )
     created_to_brigades = await b24_list(
         "crm.deal.list",
         order={"DATE_MODIFY": "ASC"},
-        filter={"CATEGORY_ID": 20, "STAGE_ID": list(_BRIGADE_STAGE_FULL), "TYPE_ID": conn_type_ids,
-                ">=DATE_MODIFY": frm_utc, "<DATE_MODIFY": to_utc},
+        filter={
+            "CATEGORY_ID": 20,
+            "STAGE_ID": list(_BRIGADE_STAGE_FULL),
+            "TYPE_ID": conn_type_ids,
+            ">=DATE_MODIFY": frm_utc, "<DATE_MODIFY": to_utc,
+        },
         select=["ID"]
     )
     created_conn = len(created_c0_exact) + len(created_to_brigades)
@@ -407,8 +348,12 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     closed_list = await b24_list(
         "crm.deal.list",
         order={"CLOSEDATE": "ASC"},
-        filter={"CATEGORY_ID": 20, "STAGE_ID": "C20:WON", "TYPE_ID": conn_type_ids,
-                ">=CLOSEDATE": frm_utc, "<CLOSEDATE": to_utc},
+        filter={
+            "CATEGORY_ID": 20,
+            "STAGE_ID": "C20:WON",
+            "TYPE_ID": conn_type_ids,
+            ">=CLOSEDATE": frm_utc, "<CLOSEDATE": to_utc,
+        },
         select=["ID"]
     )
     closed_conn = len(closed_list)
@@ -416,8 +361,13 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     active_open = await b24_list(
         "crm.deal.list",
         order={"ID": "DESC"},
-        filter={"CLOSED": "N", "CATEGORY_ID": 20, "STAGE_ID": list(_BRIGADE_STAGE_FULL),
-                "TYPE_ID": conn_type_ids, "STAGE_SEMANTIC_ID": "P"},
+        filter={
+            "CLOSED": "N",
+            "CATEGORY_ID": 20,
+            "STAGE_ID": list(_BRIGADE_STAGE_FULL),
+            "TYPE_ID": conn_type_ids,
+            "STAGE_SEMANTIC_ID": "P",
+        },
         select=["ID"]
     )
     active_conn = len(active_open)
@@ -428,8 +378,10 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     telephony = await fetch_telephony_for_day(offset_days)
 
     log.info(
-        "[summary] created=%s, closed=%s, active=%s, exact=%s, think=%s, vox_meta=%s",
-        created_conn, closed_conn, active_conn, exact_cnt, think_cnt, telephony.get("meta", {})
+        "[summary] created=%s (c0_exact=%s + to_brigades=%s), closed=%s, active=%s, exact=%s, think=%s, tel_fetched=%s/total=%s",
+        created_conn, len(created_c0_exact), len(created_to_brigades),
+        closed_conn, active_conn, exact_cnt, think_cnt,
+        telephony["meta"]["fetched"], telephony["meta"]["total"]
     )
 
     return {
