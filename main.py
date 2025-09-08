@@ -1,4 +1,4 @@
-# main.py — Fiber Reports + Telephony (Bitrix voximplant.statistic.get) — FINAL
+# main.py — Fiber Reports + Telephony (Bitrix voximplant.statistic.get) — PAGING FIX
 import asyncio, html, json, logging, os, re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple, DefaultDict
@@ -25,14 +25,13 @@ REPORT_TIME = os.environ.get("REPORT_TIME", "19:00")  # HH:MM
 
 REPORT_SUMMARY_CHAT = int(os.environ.get("REPORT_SUMMARY_CHAT", "0"))  # optional
 
-# Довідник операторів: або з ENV (JSON), або дефолт зі списку що ти давав
+# Operators map (ENV has priority)
 _TELEPHONY_OPERATORS_RAW = os.environ.get("TELEPHONY_OPERATORS", "")
 try:
     TELEPHONY_OPERATORS: Dict[str, str] = json.loads(_TELEPHONY_OPERATORS_RAW) if _TELEPHONY_OPERATORS_RAW else {}
 except Exception:
     TELEPHONY_OPERATORS = {}
 
-# дефолтні відповідності (можна прибрати, якщо триматимеш усе в ENV)
 DEFAULT_OPERATOR_MAP: Dict[str, str] = {
     "238": "Яна Тищенко",
     "1340": "Вероніка Дроботя",
@@ -41,11 +40,9 @@ DEFAULT_OPERATOR_MAP: Dict[str, str] = {
     "10000": "Руслана Писанка",
     "130": "Олена Михайленко",
 }
-
-# фінальна мапа: ENV має пріоритет
 OP_NAME: Dict[str, str] = {**DEFAULT_OPERATOR_MAP, **TELEPHONY_OPERATORS}
 
-# Опційний allowlist по ID користувачів Bitrix (JSON-список цілих), щоб виключити службові ID
+# Optional allowlist of Bitrix user IDs (JSON list of ints)
 _ALLOWED_RAW = os.environ.get("TELEPHONY_ALLOWED_USER_IDS", "").strip()
 ALLOWED_IDS: Optional[set] = None
 if _ALLOWED_RAW:
@@ -81,7 +78,8 @@ async def healthz():
 async def _sleep_backoff(attempt: int, base: float = 0.5, cap: float = 8.0):
     await asyncio.sleep(min(cap, base * (2 ** attempt)))
 
-async def b24(method: str, **params) -> Any:
+async def b24_raw(method: str, **params) -> Dict[str, Any]:
+    """Повертає сирий JSON Bitrix: може містити result, next, total, time..."""
     url = f"{BITRIX_WEBHOOK_BASE}/{method}.json"
     for attempt in range(6):
         try:
@@ -93,27 +91,47 @@ async def b24(method: str, **params) -> Any:
                         log.warning("Bitrix temp error: %s (%s), retry #%s", err, desc, attempt+1)
                         await _sleep_backoff(attempt); continue
                     raise RuntimeError(f"B24 error: {err}: {desc}")
-                return data.get("result")
+                return data
         except aiohttp.ClientError as e:
             log.warning("Bitrix network error: %s, retry #%s", e, attempt+1)
             await _sleep_backoff(attempt)
     raise RuntimeError("Bitrix request failed after retries")
 
-async def b24_list(method: str, *, page_size: int = 200, throttle: float = 0.12, **params) -> List[Dict[str, Any]]:
+async def b24(method: str, **params) -> Any:
+    """Спрощений виклик: повертає лише result (для методів без пагінації)."""
+    data = await b24_raw(method, **params)
+    return data.get("result")
+
+async def b24_list(method: str, *, throttle: float = 0.12, **params) -> List[Dict[str, Any]]:
     """
-    Узагальнене пагінування для Bitrix (параметр 'start').
+    Універсальне пагінування 'start' з урахуванням Bitrix 'next'.
+    Працює для crm.* та voximplant.statistic.get.
     """
-    start = 0
+    start: Any = params.pop("start", 0)
     out: List[Dict[str, Any]] = []
+    pages = 0
+    total_known = None
+
     while True:
         payload = dict(params); payload["start"] = start
-        res = await b24(method, **payload)
-        chunk = res if isinstance(res, list) else (res.get("items", []) if isinstance(res, dict) else [])
+        data = await b24_raw(method, **payload)
+        result = data.get("result", [])
+        if isinstance(result, dict) and "items" in result:
+            chunk = result.get("items", [])
+        else:
+            chunk = result if isinstance(result, list) else []
         out.extend(chunk)
-        if len(chunk) < page_size:
+        pages += 1
+        if total_known is None and isinstance(data.get("total"), int):
+            total_known = data["total"]
+
+        nxt = data.get("next", None)
+        if nxt is None:
             break
-        start += page_size
+        start = nxt
         if throttle: await asyncio.sleep(throttle)
+
+    log.info("[b24_list] %s: fetched %s rows in %s pages (total=%s)", method, len(out), pages, total_known)
     return out
 
 # ------------------------ Caches / mappings ---------------
@@ -196,7 +214,6 @@ def _operator_name(pid: Any) -> str:
 
 def _code_str(r: Dict[str, Any]) -> str:
     raw = str(r.get("CALL_FAILED_CODE") or r.get("FAILED_CODE") or r.get("STATUS_CODE") or "").strip()
-    # Bitrix інколи віддає "603-S" — виділимо числову частину
     m = re.search(r"\d{3}", raw)
     return m.group(0) if m else raw
 
@@ -252,27 +269,44 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
         "CALL_START_DATE", "CALL_DURATION", "CALL_FAILED_CODE",
         "CALL_TYPE", "CALL_CATEGORY", "PORTAL_USER_ID"
     ]
-    flt = {
-        ">=CALL_START_DATE": start_local_iso,
-        "<CALL_START_DATE": end_local_iso,
-    }
+    flt = {">=CALL_START_DATE": start_local_iso, "<CALL_START_DATE": end_local_iso}
 
-    rows = await b24_list(
-        "voximplant.statistic.get",
-        filter=flt,
-        select=select,
-        page_size=200,
-        throttle=0.1
-    )
-    log.info("[telephony] fetched %s rows for %s", len(rows), label)
+    # --- правильне пагінування з next ---
+    rows: List[Dict[str, Any]] = []
+    start: Any = 0
+    pages = 0
+    total_hint: Optional[int] = None
+    while True:
+        data = await b24_raw(
+            "voximplant.statistic.get",
+            filter=flt,
+            select=select,
+            start=start
+        )
+        chunk = data.get("result", [])
+        if isinstance(chunk, dict) and "items" in chunk:
+            chunk = chunk["items"]
+        if not isinstance(chunk, list):
+            chunk = []
+        rows.extend(chunk)
+        pages += 1
+        if total_hint is None and isinstance(data.get("total"), int):
+            total_hint = data["total"]
+        nxt = data.get("next", None)
+        if nxt is None:
+            break
+        start = nxt
+        await asyncio.sleep(0.1)
+
+    log.info("[telephony] %s: fetched %s rows in %s pages (total=%s)", label, len(rows), pages, total_hint)
 
     # Адаптивне визначення напрямку
     rough_in, rough_out = _rough_classify_counts(rows)
     flip = (rough_out == 0 and rough_in > 0) or (rough_in == 0 and rough_out > 0)
     dirmap = _DirMap(flip)
-    log.info("[telephony] mapping=%s (rough in=%s, out=%s)", "FLIP" if flip else "NORMAL", rough_in, rough_out)
 
-    total_records = 0
+    # Лічильники
+    total_records = len(rows)
     incoming_total = 0
     outgoing_total = 0
 
@@ -280,14 +314,13 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
     missed_total = 0
     outgoing_success_10_total = 0
 
-    per_in_total: DefaultDict[str, int] = defaultdict(int)
-    per_out_total: DefaultDict[str, int] = defaultdict(int)
-    per_in_answered: DefaultDict[str, int] = defaultdict(int)
-    per_out_success_10: DefaultDict[str, int] = defaultdict(int)
     per_processed: DefaultDict[str, int] = defaultdict(int)
+    per_in_total: DefaultDict[str, int] = defaultdict(int)
+    per_in_answered: DefaultDict[str, int] = defaultdict(int)
+    per_out_total: DefaultDict[str, int] = defaultdict(int)
+    per_out_success_10: DefaultDict[str, int] = defaultdict(int)
 
     for r in rows:
-        total_records += 1
         pid = r.get("PORTAL_USER_ID")
         if not _allowed_pid(pid):
             continue
@@ -318,8 +351,12 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
 
     return {
         "total_records": total_records,
+        "pages": pages,
+        "total_hint": total_hint,
+
         "incoming_total": incoming_total,
         "outgoing_total": outgoing_total,
+
         "incoming_answered_total": incoming_answered_total,
         "missed_total": missed_total,
         "outgoing_success_10_total": outgoing_success_10_total,
@@ -335,20 +372,25 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
 def format_telephony_summary(t: Dict[str, Any]) -> str:
     lines = []
     lines.append("📞 <b>Телефонія</b>")
-    lines.append(f"🧾 Записів (за день): <b>{t['total_records']}</b>")
-    # Всього за напрямками (як у Бітріксі)
+    if t.get("total_hint"):
+        lines.append(f"🧾 Записів (за день): <b>{t['total_records']}</b> / {t['total_hint']} · сторінок: {t['pages']}")
+    else:
+        lines.append(f"🧾 Записів (за день): <b>{t['total_records']}</b> · сторінок: {t['pages']}")
     lines.append(f"📥 Вхідних (всього): <b>{t['incoming_total']}</b>")
     lines.append(f"📤 Вихідних (всього): <b>{t['outgoing_total']}</b>")
     lines.append("")
-    # Якість обробки
     lines.append(f"✅ Вхідних (прийнятих): <b>{t['incoming_answered_total']}</b>")
     lines.append(f"🔕 Пропущених (із вхідних): <b>{t['missed_total']}</b>")
     lines.append(f"🎯 Вихідних успішних (≥10s): <b>{t['outgoing_success_10_total']}</b>")
     lines.append("")
-    # Топи по операторам
     if t["per_processed"]:
         lines.append("👥 Опрацьовано (вхідні прийняті + вихідні успішні):")
         for name, cnt in t["per_processed"]:
+            lines.append(f"• {name}: <b>{cnt}</b>")
+        lines.append("")
+    if t["per_out_success_10"]:
+        lines.append("👥 Вихідні (успішні, ≥10s) по операторам:")
+        for name, cnt in t["per_out_success_10"]:
             lines.append(f"• {name}: <b>{cnt}</b>")
         lines.append("")
     if t["per_in_total"]:
@@ -361,20 +403,15 @@ def format_telephony_summary(t: Dict[str, Any]) -> str:
         for name, cnt in t["per_in_answered"]:
             lines.append(f"• {name}: <b>{cnt}</b>")
         lines.append("")
-    if t["per_out_success_10"]:
-        lines.append("👥 Вихідні (успішні, ≥10s) по операторам:")
-        for name, cnt in t["per_out_success_10"]:
-            lines.append(f"• {name}: <b>{cnt}</b>")
-        lines.append("")
     if t.get("flip_used"):
-        lines.append("🛠 <i>Застосовано адаптивне мапінг-напрямків (flip)</i>")
+        lines.append("🛠 Застосовано адаптивне мапінг-напрямків (flip)")
     lines.append("━━━━━━━━━━━━━━━")
     return "\n".join(lines)
 
 # ------------------------ Summary builder -----------------
 async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     label, frm_utc, to_utc, _, _ = _day_bounds(offset_days)
-    type_map = await get_deal_type_map()
+    _ = await get_deal_type_map()
     conn_type_ids = await _connection_type_ids()
 
     c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
@@ -435,9 +472,9 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     telephony = await fetch_telephony_for_day(offset_days)
 
     log.info(
-        "[summary] created=%s (c0_exact=%s + to_brigades=%s), closed=%s, active=%s, exact=%s, think=%s, tel_total=%s",
+        "[summary] created=%s (c0_exact=%s + to_brigades=%s), closed=%s, active=%s, exact=%s, think=%s, tel_total=%s pages=%s",
         created_conn, len(created_c0_exact), len(created_to_brigades), closed_conn, active_conn, exact_cnt, think_cnt,
-        telephony["total_records"]
+        telephony["total_records"], telephony["pages"]
     )
 
     return {
