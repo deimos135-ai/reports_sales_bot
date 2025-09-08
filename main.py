@@ -1,183 +1,310 @@
-# main.py
-import os
-import asyncio
-import logging
-from typing import Any, Dict, List, Tuple, DefaultDict, Optional
+# main.py — Fiber Reports + Telephony (Bitrix voximplant.statistic.get)
+import asyncio, html, json, logging, os
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple, DefaultDict
 from collections import defaultdict
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
 import aiohttp
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.types import BotCommand, Message, Update
+from zoneinfo import ZoneInfo
 
+# ------------------------ Settings ------------------------
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+BITRIX_WEBHOOK_BASE = os.environ["BITRIX_WEBHOOK_BASE"].rstrip("/")
+WEBHOOK_BASE = os.environ["WEBHOOK_BASE"].rstrip("/")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "secret")
+
+REPORT_TZ_NAME = os.environ.get("REPORT_TZ", "Europe/Kyiv")
+REPORT_TZ = ZoneInfo(REPORT_TZ_NAME)
+REPORT_TIME = os.environ.get("REPORT_TIME", "19:00")  # HH:MM
+
+REPORT_SUMMARY_CHAT = int(os.environ.get("REPORT_SUMMARY_CHAT", "0"))  # optional
+
+# Довідник операторів
+_TELEPHONY_OPERATORS_RAW = os.environ.get("TELEPHONY_OPERATORS", "")
+try:
+    TELEPHONY_OPERATORS: Dict[str, str] = json.loads(_TELEPHONY_OPERATORS_RAW) if _TELEPHONY_OPERATORS_RAW else {}
+except Exception:
+    TELEPHONY_OPERATORS = {}
+
+DEFAULT_OPERATOR_MAP: Dict[str, str] = {
+    "238": "Яна Тищенко",
+    "1340": "Вероніка Дроботя",
+    "3356": "Вікторія Крамаренко",
+    "9294": "Евеліна Безсмертна",
+    "10000": "Руслана Писанка",
+    "130": "Олена Михайленко",
+}
+OP_NAME: Dict[str, str] = {**DEFAULT_OPERATOR_MAP, **TELEPHONY_OPERATORS}
+
+# Телефонія — пагінація/тротлінг
+VOX_PAGE_SIZE = int(os.environ.get("VOX_PAGE_SIZE", "200"))
+VOX_THROTTLE_SEC = float(os.environ.get("VOX_THROTTLE_SEC", "0.12"))
+VOX_HARD_LIMIT = int(os.environ.get("VOX_HARD_LIMIT", "200000"))  # запобіжник
+
+# ------------------------ Logging -------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("report_bot")
+
+# ------------------------ App/Bot -------------------------
 app = FastAPI()
-log = logging.getLogger("report")
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+HTTP: aiohttp.ClientSession
 
-# -------------------- ENV CONFIG --------------------
-# Приклад: B24_BASE_URL = "https://your.bitrix24.ua/rest/123/xxxxxxxxxxxxxxxxxxxx/"
-B24_BASE_URL = os.getenv("B24_BASE_URL", "").rstrip("/") + "/"
-# Таймзона, де у вас «день». Напр., Europe/Kyiv
-LOCAL_TZ = os.getenv("LOCAL_TZ", "Europe/Kyiv")
+# ------------------------ Health --------------------------
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
 
-# Скільки макс. рядків дозволяємо витягнути за один запит-звіт (safety valve)
-# Якщо день активний і даних багато — піде в пагінацію, але не більше HARD_LIMIT
-HARD_LIMIT = int(os.getenv("HARD_LIMIT", "50000"))
-PAGE_SIZE = int(os.getenv("PAGE_SIZE", "200"))
-THROTTLE_SEC = float(os.getenv("THROTTLE_SEC", "0.05"))  # пауза між сторінками
+# ------------------------ Bitrix helpers ------------------
+async def _sleep_backoff(attempt: int, base: float = 0.5, cap: float = 8.0):
+    await asyncio.sleep(min(cap, base * (2 ** attempt)))
 
-# -------------------- UTILS --------------------
-def _as_int(x: Any, default: int = 0) -> int:
-    try:
-        if isinstance(x, bool):
-            return int(x)
-        if isinstance(x, (int, float)):
-            return int(x)
-        s = str(x).strip()
-        # код типу "603-S" не є числом
-        return int(s) if s.lstrip("+-").isdigit() else default
-    except Exception:
-        return default
+async def b24(method: str, **params) -> Any:
+    """Повертає лише 'result' (зручно для crm.deal.list тощо)."""
+    url = f"{BITRIX_WEBHOOK_BASE}/{method}.json"
+    for attempt in range(6):
+        try:
+            async with HTTP.post(url, json=params) as resp:
+                data = await resp.json()
+                if "error" in data:
+                    err = data["error"]; desc = data.get("error_description")
+                    if err in ("QUERY_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS", "INTERNAL_SERVER_ERROR"):
+                        log.warning("Bitrix temp error: %s (%s), retry #%s", err, desc, attempt+1)
+                        await _sleep_backoff(attempt); continue
+                    raise RuntimeError(f"B24 error: {err}: {desc}")
+                return data.get("result")
+        except aiohttp.ClientError as e:
+            log.warning("Bitrix network error: %s, retry #%s", e, attempt+1)
+            await _sleep_backoff(attempt)
+    raise RuntimeError("Bitrix request failed after retries")
 
-def _as_str(x: Any) -> str:
-    return "" if x is None else str(x)
+async def b24_raw(method: str, **params) -> Dict[str, Any]:
+    """Повертає весь JSON від Bitrix: result, next, total, time…"""
+    url = f"{BITRIX_WEBHOOK_BASE}/{method}.json"
+    for attempt in range(6):
+        try:
+            async with HTTP.post(url, json=params) as resp:
+                data = await resp.json()
+                if "error" in data:
+                    err = data["error"]; desc = data.get("error_description")
+                    if err in ("QUERY_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS", "INTERNAL_SERVER_ERROR"):
+                        log.warning("Bitrix temp error: %s (%s), retry #%s", err, desc, attempt+1)
+                        await _sleep_backoff(attempt); continue
+                    raise RuntimeError(f"B24 error: {err}: {desc}")
+                return data
+        except aiohttp.ClientError as e:
+            log.warning("Bitrix network error: %s, retry #%s", e, attempt+1)
+            await _sleep_backoff(attempt)
+    raise RuntimeError("Bitrix request failed after retries")
 
-def _operator_name(portal_user_id: Any) -> str:
-    # Хук під ваш маппінг (можна підставити кеш з Bitrix users.get)
-    pid = _as_str(portal_user_id).strip()
-    if not pid:
-        return "Невідомий"
-    # приклад локального мапу з env JSON або просто повертаємо ID
-    return os.getenv(f"OP_{pid}", f"ID {pid}")
+async def b24_list(method: str, *, page_size: int = 200, throttle: float = 0.12, **params) -> List[Dict[str, Any]]:
+    """Узагальнене пагінування для методів що приймають start (crm.*)."""
+    start = 0
+    out: List[Dict[str, Any]] = []
+    while True:
+        payload = dict(params); payload["start"] = start
+        res = await b24(method, **payload)
+        chunk = res if isinstance(res, list) else (res.get("items", []) if isinstance(res, dict) else [])
+        out.extend(chunk)
+        if len(chunk) < page_size:
+            break
+        start += page_size
+        if throttle: await asyncio.sleep(throttle)
+    return out
 
-def _day_bounds(offset_days: int = 0) -> Tuple[str, datetime, datetime, str, str]:
-    tz = ZoneInfo(LOCAL_TZ)
-    today = datetime.now(tz).date()
-    day = today + timedelta(days=offset_days)
-    start = datetime.combine(day, datetime.min.time()).replace(tzinfo=tz)
-    end = start + timedelta(days=1)
-    # Bitrix любить ISO з зсувом
-    start_iso = start.isoformat()
-    end_iso = end.isoformat()
-    label = day.strftime("%d.%m.%Y")
-    return label, start, end, start_iso, end_iso
-
-async def _b24_call(session: aiohttp.ClientSession, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    # REST endpoint: {BASE}/voximplant.statistic.get.json
-    url = f"{B24_BASE_URL}{method}.json"
-    async with session.post(url, data=params, timeout=aiohttp.ClientTimeout(total=90)) as resp:
-        resp.raise_for_status()
-        return await resp.json(content_type=None)
-
-async def b24_paginated_list(
-    method: str,
+async def b24_vox_paginate(
     *,
-    filter: Dict[str, Any],
+    flt: Dict[str, Any],
     select: List[str],
-    page_size: int = PAGE_SIZE,
-    hard_limit: int = HARD_LIMIT,
-    throttle: float = THROTTLE_SEC,
-) -> List[Dict[str, Any]]:
+    order: Optional[Dict[str, Any]] = None,
+    page_size: int = VOX_PAGE_SIZE,
+    throttle: float = VOX_THROTTLE_SEC,
+    hard_limit: int = VOX_HARD_LIMIT,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Загальний пагінатор для Bitrix list-методів зі схемою start/next.
+    Спеціальний пагінатор для voximplant.statistic.get — використовує 'next' і зберігає 'total'.
+    Повертає (rows, meta), де meta = {total, fetched, pages, page_size, time:{...}}
     """
     rows: List[Dict[str, Any]] = []
-    start = 0
-    seen = 0
+    start: Optional[int] = 0
+    total: Optional[int] = None
+    pages = 0
+    last_time = None
 
-    async with aiohttp.ClientSession() as session:
-        while True:
-            params: Dict[str, Any] = {
-                "select[]": select,  # масив селектів
-                "start": start,
-            }
-            # Фільтр: ключі типу ">=CALL_START_DATE" мають йти як filter[>=CALL_START_DATE]
-            for k, v in filter.items():
-                params[f"filter[{k}]"] = v
+    while True:
+        payload = {
+            "filter": flt,
+            "select": select,
+            "order": order or {"CALL_START_DATE": "ASC"},
+            "start": start,
+        }
+        data = await b24_raw("voximplant.statistic.get", **payload)
+        chunk = data.get("result", []) or []
+        total = data.get("total", total)
+        last_time = data.get("time")
+        rows.extend(chunk)
+        pages += 1
 
-            # Додатково: деякі методи приймають "limit"
-            params["limit"] = page_size
+        # стоп умови
+        next_start = data.get("next")
+        if next_start is None:
+            break
+        if len(rows) >= hard_limit:
+            log.warning("[vox] hard limit reached: %s >= %s", len(rows), hard_limit)
+            break
 
-            data = await _b24_call(session, method, params)
-            result = data.get("result", [])
-            total = data.get("total")  # може бути відсутнім
-            nxt = data.get("next")
+        start = next_start
+        if throttle:
+            await asyncio.sleep(throttle)
 
-            if not isinstance(result, list):
-                log.warning("Unexpected result type: %s", type(result))
-                break
+    meta = {
+        "total": int(total or 0),
+        "fetched": len(rows),
+        "pages": pages,
+        "page_size": page_size,
+        "time": last_time or {},
+    }
+    return rows, meta
 
-            rows.extend(result)
-            seen += len(result)
+# ------------------------ Caches / mappings ---------------
+_DEAL_TYPE_MAP: Optional[Dict[str, str]] = None
+async def get_deal_type_map() -> Dict[str, str]:
+    global _DEAL_TYPE_MAP
+    if _DEAL_TYPE_MAP is None:
+        items = await b24("crm.status.list", filter={"ENTITY_ID": "DEAL_TYPE"})
+        _DEAL_TYPE_MAP = {i["STATUS_ID"]: i["NAME"] for i in items}
+        log.info("[cache] DEAL_TYPE: %s", len(_DEAL_TYPE_MAP))
+    return _DEAL_TYPE_MAP
 
-            # Прогрес-лог кожні ~1000 рядків
-            if seen % 1000 < len(result):
-                log.info("[b24] fetched %s rows (start=%s, next=%s, total=%s)", seen, start, nxt, total)
+def _is_connection(type_id: str, type_name: Optional[str] = None) -> bool:
+    name = (type_name or "").strip().lower()
+    if not name and _DEAL_TYPE_MAP:
+        name = (_DEAL_TYPE_MAP.get(type_id, "") or "").strip().lower()
+    return (name in ("підключення", "подключение") or ("підключ" in name) or ("подключ" in name))
 
-            if seen >= hard_limit:
-                log.warning("[b24] hard limit reached: %s", hard_limit)
-                break
+async def _connection_type_ids() -> List[str]:
+    m = await get_deal_type_map()
+    return [tid for tid, nm in m.items() if _is_connection(tid, nm)]
 
-            if nxt is None:
-                break
+_BRIGADE_STAGE = {1: "UC_XF8O6V", 2: "UC_0XLPCN", 3: "UC_204CP3", 4: "UC_TNEW3Z", 5: "UC_RMBZ37"}
+_BRIGADE_STAGE_FULL = {f"C20:{v}" for v in _BRIGADE_STAGE.values()}
 
-            start = nxt
-            if throttle:
-                await asyncio.sleep(throttle)
+# ------------------------ Time helpers -------------------
+def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str, str, str]:
+    now_local = datetime.now(REPORT_TZ)
+    start_local = (now_local - timedelta(days=offset_days)).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = start_local + timedelta(days=1)
 
-    return rows
+    def _fmt_local(dt: datetime) -> str:
+        return dt.strftime("%Y-%m-%dT%H:%M:%S%z")
 
-# -------------------- TELEPHONY LOGIC --------------------
-def _is_incoming(r: Dict[str, Any]) -> bool:
-    return _as_int(r.get("CALL_TYPE"), -1) == 1
+    start_utc = start_local.astimezone(timezone.utc).isoformat()
+    end_utc = end_local.astimezone(timezone.utc).isoformat()
+    label = start_local.strftime("%d.%m.%Y")
+    return label, start_utc, end_utc, _fmt_local(start_local), _fmt_local(end_local)
 
-def _is_outgoing(r: Dict[str, Any]) -> bool:
-    return _as_int(r.get("CALL_TYPE"), -1) == 2
+# ------------------------ CAT0 stage resolving ------------
+_CAT0_STAGES: Optional[Dict[str, str]] = None
+async def _cat0_stages() -> Dict[str, str]:
+    global _CAT0_STAGES
+    if _CAT0_STAGES is None:
+        items = await b24("crm.status.list", filter={"ENTITY_ID": "DEAL_STAGE_0"})
+        _CAT0_STAGES = {i["STATUS_ID"]: i["NAME"] for i in items}
+        log.info("[cache] CAT0 stages: %s", len(_CAT0_STAGES))
+    return _CAT0_STAGES
+
+async def _resolve_cat0_stage_ids() -> Tuple[str, str]:
+    st = await _cat0_stages()
+    exact_id = None; think_id = None
+    for sid, nm in st.items():
+        n = (nm or "").strip().lower()
+        if n == "на конкретний день": exact_id = sid
+        if n == "думають": think_id = sid
+    if not exact_id: exact_id = "5"
+    if not think_id: think_id = "DETAILS"
+    return f"C0:{exact_id}", f"C0:{think_id}"
+
+async def _count_open_in_stage(cat_id: int, stage_full: str, type_ids: Optional[List[str]] = None) -> int:
+    flt: Dict[str, Any] = {"CLOSED": "N", "CATEGORY_ID": cat_id, "STAGE_ID": stage_full}
+    if type_ids: flt["TYPE_ID"] = type_ids
+    deals = await b24_list("crm.deal.list", order={"ID": "DESC"}, filter=flt, select=["ID"])
+    if deals: return len(deals)
+    short = stage_full.split(":", 1)[-1]
+    flt["STAGE_ID"] = short
+    deals_fb = await b24_list("crm.deal.list", order={"ID": "DESC"}, filter=flt, select=["ID"])
+    return len(deals_fb)
+
+# ------------------------ Telephony (Bitrix) --------------
+def _operator_name(pid: Any) -> str:
+    if pid is None:
+        return "Невідомий оператор"
+    sid = str(pid)
+    return OP_NAME.get(sid) or f"ID {sid}"
+
+def _is_incoming_by_category(cat: str) -> Optional[bool]:
+    cat = (cat or "").strip().lower()
+    if not cat:
+        return None
+    # найчастіші кейси
+    if cat in {"external"}:
+        return False  # зазвичай вихідні
+    if cat in {"callback", "calltracking", "ivr", "queue", "sip"}:
+        return True
+    return None  # невідомо
+
+def _incoming_outgoing_flags(r: Dict[str, Any]) -> Tuple[bool, bool]:
+    """
+    Повертає (is_incoming, is_outgoing) з урахуванням розбіжностей у даних.
+    1) Якщо CALL_TYPE виглядає валідно — використовуємо його (1=in, 2=out).
+    2) Інакше пробуємо CALL_CATEGORY.
+    3) Фолбек: якщо тривалість > 0 і є PORTAL_USER_ID — допускаємо як прийнятий вхідний або вихідний?
+       Тут нічого не вигадуємо — повертаємо (False, False), щоб не псувати статистику.
+    """
+    ct = r.get("CALL_TYPE")
+    if isinstance(ct, int) and ct in (1, 2):
+        return (ct == 1, ct == 2)
+
+    by_cat = _is_incoming_by_category(r.get("CALL_CATEGORY"))
+    if by_cat is not None:
+        return (by_cat, not by_cat)
+
+    return (False, False)
 
 def _is_missed_incoming(r: Dict[str, Any]) -> bool:
-    # Пропущений — ТІЛЬКИ вхідний і з нульовою тривалістю
-    if not _is_incoming(r):
+    is_in, _ = _incoming_outgoing_flags(r)
+    if not is_in:
         return False
-    dur = _as_int(r.get("CALL_DURATION") or r.get("DURATION"), 0)
-    return dur <= 0
-
-def _is_answered_incoming(r: Dict[str, Any]) -> bool:
-    if not _is_incoming(r):
-        return False
-    dur = _as_int(r.get("CALL_DURATION") or r.get("DURATION"), 0)
-    code = _as_str(r.get("CALL_FAILED_CODE")).upper()
-    # У практиці Bitrix/Asterisk прийнятий зазвичай має duration>0, а код "200"/порожній/OK
-    return (dur > 0) and (code in ("", "0", "200", "OK"))
+    dur = int(r.get("CALL_DURATION") or r.get("DURATION") or 0)
+    failed = str(r.get("CALL_FAILED_CODE") or "").strip()
+    # пропущені — якщо 0 секунд або є код помилки
+    return dur == 0 or failed != ""
 
 async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
-    label, _, _, start_iso, end_iso = _day_bounds(offset_days)
+    label, _, _, start_local_iso, end_local_iso = _day_bounds(offset_days)
 
     select = [
-        "ID",
-        "PORTAL_USER_ID",
-        "PORTAL_NUMBER",
-        "PHONE_NUMBER",
-        "CALL_ID",
-        "CALL_CATEGORY",
-        "CALL_DURATION",
-        "CALL_START_DATE",
-        "CALL_FAILED_CODE",
-        "CALL_TYPE",
+        "CALL_START_DATE", "CALL_DURATION", "CALL_FAILED_CODE",
+        "CALL_TYPE", "CALL_CATEGORY", "PORTAL_USER_ID"
     ]
     flt = {
-        ">=CALL_START_DATE": start_iso,
-        "<CALL_START_DATE": end_iso,
+        ">=CALL_START_DATE": start_local_iso,
+        "<CALL_START_DATE": end_local_iso,
     }
 
-    rows = await b24_paginated_list(
-        "voximplant.statistic.get",
-        filter=flt,
+    rows, meta = await b24_vox_paginate(
+        flt=flt,
         select=select,
-        page_size=PAGE_SIZE,
-        hard_limit=HARD_LIMIT,
-        throttle=THROTTLE_SEC,
+        order={"CALL_START_DATE": "ASC"},
     )
-    log.info("[telephony] %s: fetched %s calls", label, len(rows))
+    log.info("[telephony] %s: fetched=%s total=%s pages=%s",
+             label, meta["fetched"], meta["total"], meta["pages"])
 
     missed_total = 0
     incoming_answered_total = 0
@@ -187,21 +314,19 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
     per_outgoing_by_op: DefaultDict[str, int] = defaultdict(int)
 
     for r in rows:
-        name = _operator_name(r.get("PORTAL_USER_ID"))
+        op = _operator_name(r.get("PORTAL_USER_ID"))
+        is_in, is_out = _incoming_outgoing_flags(r)
 
-        if _is_incoming(r):
-            if _is_missed_incoming(r):
-                missed_total += 1
-            elif _is_answered_incoming(r):
-                incoming_answered_total += 1
-                per_incoming_by_op[name] += 1
-            else:
-                # Інші вхідні (напр., zero duration + код 200 не трапляється, але на всяк випадок)
-                missed_total += 1
+        if _is_missed_incoming(r):
+            missed_total += 1
 
-        if _is_outgoing(r):
+        if is_in and not _is_missed_incoming(r):
+            incoming_answered_total += 1
+            per_incoming_by_op[op] += 1
+
+        if is_out:
             outgoing_total += 1
-            per_outgoing_by_op[name] += 1
+            per_outgoing_by_op[op] += 1
 
     def _sorted_items(d: Dict[str, int]) -> List[Tuple[str, int]]:
         return sorted(d.items(), key=lambda x: (-x[1], x[0]))
@@ -212,65 +337,216 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
         "outgoing_total": outgoing_total,
         "incoming_by_operator": _sorted_items(per_incoming_by_op),
         "outgoing_by_operator": _sorted_items(per_outgoing_by_op),
-        "total_rows": len(rows),
+        "meta": meta,  # <-- для контролю: total/fetched/pages/page_size
     }
 
-# -------------------- REPORT TEXT --------------------
-def build_report_text(offset_days: int, telephony: Dict[str, Any]) -> str:
-    label, *_ = _day_bounds(offset_days)
-    missed = telephony["missed_total"]
-    in_ok = telephony["incoming_answered_total"]
-    out_all = telephony["outgoing_total"]
+def format_telephony_summary(t: Dict[str, Any]) -> str:
+    lines = []
+    lines.append("📞 <b>Телефонія</b>")
+    lines.append(f"🔕 Пропущених: <b>{t['missed_total']}</b>")
+    lines.append(f"📥 Вхідних (прийнятих): <b>{t['incoming_answered_total']}</b>")
+    lines.append(f"📤 Вихідних: <b>{t['outgoing_total']}</b>")
+    lines.append("")
+    if t["incoming_by_operator"]:
+        lines.append("👥 По операторам (вхідні):")
+        for name, cnt in t["incoming_by_operator"]:
+            lines.append(f"• {name}: <b>{cnt}</b>")
+        lines.append("")
+    if t["outgoing_by_operator"]:
+        lines.append("👥 По операторам (вихідні):")
+        for name, cnt in t["outgoing_by_operator"]:
+            lines.append(f"• {name}: <b>{cnt}</b>")
+        lines.append("")
+    lines.append("━━━━━━━━━━━━━━━")
+    return "\n".join(lines)
 
-    inc_ops = telephony["incoming_by_operator"]
-    out_ops = telephony["outgoing_by_operator"]
+# ------------------------ Summary builder -----------------
+async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
+    label, frm_utc, to_utc, _, _ = _day_bounds(offset_days)
 
-    def lines_for_ops(title: str, items: List[Tuple[str, int]]) -> str:
-        if not items:
-            return ""
-        s = [title]
-        for name, cnt in items:
-            s.append(f"• {name}: {cnt}")
-        return "\n".join(s)
+    conn_type_ids = await _connection_type_ids()
+    c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
 
-    chunks = [
-        f"🗓 Дата: {label}",
-        "━━━━━━━━━━━━━━━",
-        "📞 Телефонія",
-        f"🔕 Пропущених: {missed}",
-        f"📥 Вхідних (прийнятих): {in_ok}",
-        f"📤 Вихідних: {out_all}",
-    ]
+    created_c0_exact = await b24_list(
+        "crm.deal.list",
+        order={"ID": "DESC"},
+        filter={
+            "CATEGORY_ID": 0,
+            "STAGE_ID": c0_exact_stage,
+            "TYPE_ID": conn_type_ids,
+            ">=DATE_CREATE": frm_utc, "<DATE_CREATE": to_utc,
+        },
+        select=["ID"]
+    )
+    created_to_brigades = await b24_list(
+        "crm.deal.list",
+        order={"DATE_MODIFY": "ASC"},
+        filter={
+            "CATEGORY_ID": 20,
+            "STAGE_ID": list(_BRIGADE_STAGE_FULL),
+            "TYPE_ID": conn_type_ids,
+            ">=DATE_MODIFY": frm_utc, "<DATE_MODIFY": to_utc,
+        },
+        select=["ID"]
+    )
+    created_conn = len(created_c0_exact) + len(created_to_brigades)
 
-    inc_block = lines_for_ops("\n👥 По операторам (вхідні, прийняті):", inc_ops)
-    out_block = lines_for_ops("\n👥 По операторам (вихідні):", out_ops)
+    closed_list = await b24_list(
+        "crm.deal.list",
+        order={"CLOSEDATE": "ASC"},
+        filter={
+            "CATEGORY_ID": 20,
+            "STAGE_ID": "C20:WON",
+            "TYPE_ID": conn_type_ids,
+            ">=CLOSEDATE": frm_utc, "<CLOSEDATE": to_utc,
+        },
+        select=["ID"]
+    )
+    closed_conn = len(closed_list)
 
-    if inc_block:
-        chunks.append(inc_block)
-    if out_block:
-        chunks.append(out_block)
+    active_open = await b24_list(
+        "crm.deal.list",
+        order={"ID": "DESC"},
+        filter={
+            "CLOSED": "N",
+            "CATEGORY_ID": 20,
+            "STAGE_ID": list(_BRIGADE_STAGE_FULL),
+            "TYPE_ID": conn_type_ids,
+            "STAGE_SEMANTIC_ID": "P",
+        },
+        select=["ID"]
+    )
+    active_conn = len(active_open)
 
-    chunks.append("━━━━━━━━━━━━━━━")
-    return "\n".join(chunks)
+    exact_cnt = await _count_open_in_stage(0, c0_exact_stage, conn_type_ids)
+    think_cnt = await _count_open_in_stage(0, c0_think_stage, conn_type_ids)
 
-# -------------------- HTTP HANDLERS --------------------
-@app.get("/report/today")
-async def report_today() -> Dict[str, Any]:
-    t = await fetch_telephony_for_day(0)
+    telephony = await fetch_telephony_for_day(offset_days)
+
+    log.info(
+        "[summary %s] created=%s, closed=%s, active=%s, exact=%s, think=%s, tel_meta=%s",
+        label, created_conn, closed_conn, active_conn, exact_cnt, think_cnt, telephony.get("meta")
+    )
+
     return {
-        "text": build_report_text(0, t),
-        "raw": t,
+        "date_label": label,
+        "connections": {"created": created_conn, "closed": closed_conn, "active": active_conn},
+        "cat0": {"exact_day": exact_cnt, "think": think_cnt},
+        "telephony": telephony,
     }
 
-@app.get("/report/yesterday")
-async def report_yesterday() -> Dict[str, Any]:
-    t = await fetch_telephony_for_day(-1)
-    return {
-        "text": build_report_text(-1, t),
-        "raw": t,
-    }
+def format_company_summary(d: Dict[str, Any]) -> str:
+    dl = d["date_label"]
+    c = d["connections"]; c0 = d["cat0"]; t = d["telephony"]
 
-# кореневий хелсчек
-@app.get("/")
-async def root():
+    parts = []
+    parts.append(f"🗓 <b>Дата: {dl}</b>")
+    parts.append("")
+    parts.append("━━━━━━━━━━━━━━━")
+    parts.append("📌 <b>Підключення</b>")
+    parts.append(f"🆕 Подали: <b>{c['created']}</b>")
+    parts.append(f"✅ Закрили: <b>{c['closed']}</b>")
+    parts.append(f"📊 Активні на бригадах: <b>{c['active']}</b>")
+    parts.append("")
+    parts.append(f"📅 На конкретний день: <b>{c0['exact_day']}</b>")
+    parts.append(f"💭 Думають: <b>{c0['think']}</b>")
+    parts.append("━━━━━━━━━━━━━━━")
+    parts.append(format_telephony_summary(t))
+    return "\n".join(parts)
+
+# ------------------------ Send helpers -------------------
+async def _safe_send(chat_id: int, text: str):
+    for attempt in range(7):
+        try:
+            await bot.send_message(chat_id, text, disable_web_page_preview=True)
+            return
+        except Exception as e:
+            msg = str(e)
+            retry_after = None
+            if "retry after " in msg.lower():
+                try:
+                    retry_after = int(msg.lower().split("retry after ")[1].split()[0])
+                except Exception:
+                    retry_after = None
+            wait = retry_after if retry_after else min(30, 2 ** attempt)
+            log.warning("telegram send failed: %s, waiting %ss (try #%s)", e, wait, attempt+1)
+            await asyncio.sleep(wait)
+    log.error("telegram send failed permanently (chat %s)", chat_id)
+
+async def send_company_summary_to_chat(target_chat: int, offset_days: int = 0) -> None:
+    try:
+        data = await build_company_summary(offset_days)
+        await _safe_send(target_chat, format_company_summary(data))
+    except Exception as e:
+        log.exception("company summary failed for chat %s", target_chat)
+        await _safe_send(target_chat, f"❗️Помилка формування сумарного звіту:\n<code>{html.escape(str(e))}</code>")
+
+async def send_company_summary(offset_days: int = 0) -> None:
+    if REPORT_SUMMARY_CHAT:
+        await send_company_summary_to_chat(REPORT_SUMMARY_CHAT, offset_days)
+    else:
+        log.warning("REPORT_SUMMARY_CHAT is not configured")
+
+# ------------------------ Manual command -----------------
+@dp.message(Command("report_now"))
+async def report_now(m: Message):
+    parts = (m.text or "").split()
+    offset = 0
+    if len(parts) >= 2 and parts[1].lstrip("-").isdigit():
+        offset = int(parts[1])
+
+    await m.answer("🔄 Формую сумарний звіт…")
+    await send_company_summary_to_chat(m.chat.id, offset)
+    if REPORT_SUMMARY_CHAT and REPORT_SUMMARY_CHAT != m.chat.id:
+        await send_company_summary_to_chat(REPORT_SUMMARY_CHAT, offset)
+    await m.answer("✅ Готово")
+
+# ------------------------ Scheduler ----------------------
+def _next_run_dt(now_utc: datetime) -> datetime:
+    hh, mm = map(int, REPORT_TIME.split(":", 1))
+    now_local = now_utc.astimezone(REPORT_TZ)
+    target_local = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if target_local <= now_local: target_local += timedelta(days=1)
+    return target_local.astimezone(timezone.utc)
+
+async def scheduler_loop():
+    log.info("[scheduler] started")
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            nxt = _next_run_dt(now_utc)
+            sleep_sec = max(1, (nxt - now_utc).total_seconds())
+            log.info("[scheduler] next run at %s in %ss", nxt.isoformat(), int(sleep_sec))
+            await asyncio.sleep(sleep_sec)
+            log.info("[scheduler] tick -> sending summary")
+            await send_company_summary(0)
+        except Exception:
+            log.exception("[scheduler] loop error")
+            await asyncio.sleep(5)
+
+# ------------------------ Webhook plumbing ---------------
+@app.on_event("startup")
+async def on_startup():
+    global HTTP
+    HTTP = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
+    await bot.set_my_commands([
+        BotCommand(command="report_now", description="Сумарний звіт (/report_now [offset])"),
+    ])
+    url = f"{WEBHOOK_BASE}/webhook/{WEBHOOK_SECRET}"
+    await bot.set_webhook(url)
+    asyncio.create_task(scheduler_loop())
+    log.info("[startup] webhook set to %s", url)
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await bot.delete_webhook()
+    await HTTP.close()
+    await bot.session.close()
+
+@app.post("/webhook/{secret}")
+async def telegram_webhook(secret: str, request: Request):
+    if secret != WEBHOOK_SECRET:
+        return {"ok": False}
+    update = Update.model_validate(await request.json())
+    await dp.feed_update(bot, update)
     return {"ok": True}
