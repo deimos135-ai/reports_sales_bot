@@ -1,4 +1,4 @@
-# main.py — Fiber Reports + Telephony (Bitrix voximplant.statistic.get) — repeats counted
+# main.py — Fiber Reports + Telephony (Bitrix voximplant.statistic.get)
 import asyncio, html, json, logging, os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple, DefaultDict
@@ -25,13 +25,14 @@ REPORT_TIME = os.environ.get("REPORT_TIME", "19:00")  # HH:MM
 
 REPORT_SUMMARY_CHAT = int(os.environ.get("REPORT_SUMMARY_CHAT", "0"))  # optional
 
-# Довідник операторів (ENV має пріоритет)
+# Довідник операторів: або з ENV (JSON), або дефолт зі списку що ти давав
 _TELEPHONY_OPERATORS_RAW = os.environ.get("TELEPHONY_OPERATORS", "")
 try:
     TELEPHONY_OPERATORS: Dict[str, str] = json.loads(_TELEPHONY_OPERATORS_RAW) if _TELEPHONY_OPERATORS_RAW else {}
 except Exception:
     TELEPHONY_OPERATORS = {}
 
+# дефолтні відповідності (можна прибрати, якщо триматимеш усе в ENV)
 DEFAULT_OPERATOR_MAP: Dict[str, str] = {
     "238": "Яна Тищенко",
     "1340": "Вероніка Дроботя",
@@ -39,7 +40,10 @@ DEFAULT_OPERATOR_MAP: Dict[str, str] = {
     "9294": "Евеліна Безсмертна",
     "10000": "Руслана Писанка",
     "130": "Олена Михайленко",
+    # залишив приклади; можна розширити ENV-ом
 }
+
+# фінальна мапа: ENV має пріоритет
 OP_NAME: Dict[str, str] = {**DEFAULT_OPERATOR_MAP, **TELEPHONY_OPERATORS}
 
 # ------------------------ Logging -------------------------
@@ -61,9 +65,9 @@ async def healthz():
 async def _sleep_backoff(attempt: int, base: float = 0.5, cap: float = 8.0):
     await asyncio.sleep(min(cap, base * (2 ** attempt)))
 
-async def b24_full(method: str, **params) -> Dict[str, Any]:
+async def b24_raw(method: str, **params) -> Dict[str, Any]:
     """
-    Повертає повну відповідь Bitrix (з полями result/next/total), щоб мати метадані пагінації.
+    Повертає повний JSON (із полями result/next/total/time).
     """
     url = f"{BITRIX_WEBHOOK_BASE}/{method}.json"
     for attempt in range(6):
@@ -83,26 +87,38 @@ async def b24_full(method: str, **params) -> Dict[str, Any]:
     raise RuntimeError("Bitrix request failed after retries")
 
 async def b24(method: str, **params) -> Any:
-    data = await b24_full(method, **params)
+    """
+    Зручний шорткат: повертає тільки result.
+    """
+    data = await b24_raw(method, **params)
     return data.get("result")
 
 async def b24_list(method: str, *, page_size: int = 200, throttle: float = 0.12, **params) -> List[Dict[str, Any]]:
     """
-    Узагальнене пагінування для Bitrix. Працює і з crm.deal.list, і з voximplant.statistic.get.
+    Узагальнене пагінування для методів з параметром 'start'.
+    Використовує raw-відповідь, якщо є 'next', інакше — евристика за розміром chunk.
     """
     start = 0
     out: List[Dict[str, Any]] = []
     while True:
         payload = dict(params); payload["start"] = start
-        data = await b24_full(method, **payload)
+        data = await b24_raw(method, **payload)
         res = data.get("result")
         chunk = res if isinstance(res, list) else (res.get("items", []) if isinstance(res, dict) else [])
         out.extend(chunk)
         nxt = data.get("next")
-        if not nxt or len(chunk) < page_size:
-            break
-        start = nxt
-        if throttle: await asyncio.sleep(throttle)
+        if not nxt:
+            # інколи next немає, тоді закінчуємо якщо отримали мало
+            if len(chunk) < page_size:
+                break
+            # якщо однакова довжина і next немає — перестраховка
+            if len(chunk) == 0:
+                break
+            start += page_size
+        else:
+            start = nxt
+        if throttle:
+            await asyncio.sleep(throttle)
     return out
 
 # ------------------------ Caches / mappings ---------------
@@ -136,12 +152,17 @@ _BRIGADE_STAGE_FULL = {f"C20:{v}" for v in _BRIGADE_STAGE.values()}
 # ------------------------ Time helpers -------------------
 def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str, str, str]:
     """
-    label (ДД.ММ.РРРР), start_utc_iso, end_utc_iso, start_local_with_tz, end_local_with_tz
+    Повертає:
+      label (ДД.ММ.РРРР локально),
+      start_utc_iso, end_utc_iso,
+      start_local_iso, end_local_iso
+    Для Bitrix-фільтра по CALL_START_DATE краще давати локальний час із тайзоною.
     """
     now_local = datetime.now(REPORT_TZ)
     start_local = (now_local - timedelta(days=offset_days)).replace(hour=0, minute=0, second=0, microsecond=0)
     end_local = start_local + timedelta(days=1)
-    def _fmt_local(dt: datetime) -> str: return dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+    def _fmt_local(dt: datetime) -> str:
+        return dt.strftime("%Y-%m-%dT%H:%M:%S%z")
     start_utc = start_local.astimezone(timezone.utc).isoformat()
     end_utc = end_local.astimezone(timezone.utc).isoformat()
     label = start_local.strftime("%d.%m.%Y")
@@ -164,8 +185,8 @@ async def _resolve_cat0_stage_ids() -> Tuple[str, str]:
         n = (nm or "").strip().lower()
         if n == "на конкретний день": exact_id = sid
         if n == "думають": think_id = sid
-    if not exact_id: exact_id = "5"
-    if not think_id: think_id = "DETAILS"
+    if not exact_id: exact_id = "5"         # fallback
+    if not think_id: think_id = "DETAILS"   # fallback
     return f"C0:{exact_id}", f"C0:{think_id}"
 
 async def _count_open_in_stage(cat_id: int, stage_full: str, type_ids: Optional[List[str]] = None) -> int:
@@ -180,9 +201,9 @@ async def _count_open_in_stage(cat_id: int, stage_full: str, type_ids: Optional[
 
 # ------------------------ Telephony (Bitrix) --------------
 def _code_str(r: Dict[str, Any]) -> str:
-    raw = str(r.get("CALL_FAILED_CODE") or "").strip()
-    # приклади: "603-S", "200", "486" -> беремо першу частину
-    return raw.split("-", 1)[0] if raw else ""
+    v = r.get("CALL_FAILED_CODE")
+    if v is None: return ""
+    return str(v).split("-", 1)[0].strip()
 
 def _duration_sec(r: Dict[str, Any]) -> int:
     try:
@@ -191,25 +212,28 @@ def _duration_sec(r: Dict[str, Any]) -> int:
         return 0
 
 def _is_incoming(r: Dict[str, Any]) -> bool:
-    # За документацією Bitrix: CALL_TYPE 1=IN, 2=OUT (але бувають криві значення — тримаємо fallback)
+    # CALL_TYPE: 1 — incoming; 2 — outgoing (за документацією).
     ct = r.get("CALL_TYPE")
     if isinstance(ct, int):
         return ct == 1
-    if isinstance(ct, str) and ct.isdigit():
-        return int(ct) == 1
-    # запасний варіант: callback вважаємо вхідним
     cat = (r.get("CALL_CATEGORY") or "").lower()
-    return cat in {"callback"}
+    # На практиці external/callback — це вхідні
+    return cat in {"external", "callback"}
 
 def _is_outgoing(r: Dict[str, Any]) -> bool:
     ct = r.get("CALL_TYPE")
     if isinstance(ct, int):
         return ct == 2
-    if isinstance(ct, str) and ct.isdigit():
-        return int(ct) == 2
     cat = (r.get("CALL_CATEGORY") or "").lower()
-    # якщо не змогли визначити — зовнішні виклики з REST_APP зазвичай вихідні
-    return cat in {"external", "outgoing"}
+    return cat in {"outgoing"}
+
+def _is_missed(r: Dict[str, Any]) -> bool:
+    if not _is_incoming(r):
+        return False
+    dur = _duration_sec(r)
+    code = _code_str(r)
+    # Пропущений: або неуспішний код, або нульова тривалість
+    return (code != "200") or (dur == 0)
 
 def _operator_name(pid: Any) -> str:
     if pid is None:
@@ -224,38 +248,48 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
         "CALL_START_DATE", "CALL_DURATION", "CALL_FAILED_CODE",
         "CALL_TYPE", "CALL_CATEGORY", "PORTAL_USER_ID"
     ]
-    flt = {">=CALL_START_DATE": start_local_iso, "<CALL_START_DATE": end_local_iso}
+    flt = {
+        ">=CALL_START_DATE": start_local_iso,
+        "<CALL_START_DATE": end_local_iso,
+    }
 
-    # Ручна пагінація по voximplant.statistic.get, щоби мати next/total/сторінки
+    # Ручна пагінація з повним доступом до next/total
     start = 0
-    page_size = 200
+    pages = 0
     throttle = 0.08
     total_reported: Optional[int] = None
-    pages = 0
     rows: List[Dict[str, Any]] = []
 
     while True:
-        data = await b24_full("voximplant.statistic.get", filter=flt, select=select, start=start)
+        data = await b24_raw("voximplant.statistic.get", filter=flt, select=select, start=start)
         res = data.get("result")
         chunk = res if isinstance(res, list) else (res.get("items", []) if isinstance(res, dict) else [])
         rows.extend(chunk)
         pages += 1
-        if total_reported is None:
-            total_reported = data.get("total")
+        if total_reported is None and isinstance(data.get("total"), int):
+            total_reported = data["total"]
         nxt = data.get("next")
         if not nxt or not chunk:
             break
         start = nxt
-        if throttle: await asyncio.sleep(throttle)
+        if throttle:
+            await asyncio.sleep(throttle)
 
-    # Лічильники
-    missed_total = 0
-    incoming_answered_total = 0
-    outgoing_success_total = 0
+    # Загальні лічильники (як у Бітріксі: з повторами, без фільтра за тривалістю/кодом)
+    incoming_total = 0
+    outgoing_total = 0
 
-    per_incoming_by_op: DefaultDict[str, int] = defaultdict(int)
-    per_outgoing_by_op: DefaultDict[str, int] = defaultdict(int)
-    per_processed_by_op: DefaultDict[str, int] = defaultdict(int)
+    # Додаткові метрики
+    incoming_answered_total = 0            # прийняті (code==200 & dur>0)
+    missed_total = 0                       # пропущені (для вхідних): code!=200 або dur==0
+    outgoing_success_10_total = 0          # успішні вихідні з розмовою ≥10s
+
+    # По операторам
+    per_in_total: DefaultDict[str, int] = defaultdict(int)
+    per_out_total: DefaultDict[str, int] = defaultdict(int)
+    per_in_answered: DefaultDict[str, int] = defaultdict(int)
+    per_out_success_10: DefaultDict[str, int] = defaultdict(int)
+    per_processed: DefaultDict[str, int] = defaultdict(int)  # in_answered + out_success_10
 
     for r in rows:
         pid = r.get("PORTAL_USER_ID")
@@ -264,25 +298,26 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
         dur = _duration_sec(r)
 
         if _is_incoming(r):
+            incoming_total += 1
+            per_in_total[name] += 1
+
             if code == "200" and dur > 0:
                 incoming_answered_total += 1
-                per_incoming_by_op[name] += 1
-                per_processed_by_op[name] += 1
+                per_in_answered[name] += 1
+                per_processed[name] += 1
             else:
-                # лише вхідні можуть бути пропущеними
                 missed_total += 1
 
         elif _is_outgoing(r):
-            if code == "200" and dur >= 10:
-                outgoing_success_total += 1
-                per_outgoing_by_op[name] += 1
-                per_processed_by_op[name] += 1
-        else:
-            # якщо напрям не визначився — не враховуємо
-            pass
+            outgoing_total += 1
+            per_out_total[name] += 1
 
-    # сортування
-    def _sorted_items(d: Dict[str, int]) -> List[Tuple[str, int]]:
+            if code == "200" and dur >= 10:
+                outgoing_success_10_total += 1
+                per_out_success_10[name] += 1
+                per_processed[name] += 1
+
+    def _sorted(d: Dict[str, int]) -> List[Tuple[str, int]]:
         return sorted(d.items(), key=lambda x: (-x[1], x[0]))
 
     return {
@@ -292,48 +327,69 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
             "fetched": len(rows),
             "total": total_reported if isinstance(total_reported, int) else len(rows),
         },
+        # головні (як у Bitrix: усі вхідні/усі вихідні)
+        "incoming_total": incoming_total,
+        "outgoing_total": outgoing_total,
+        # додаткові метрики якості
         "missed_total": missed_total,
         "incoming_answered_total": incoming_answered_total,
-        "outgoing_success_total": outgoing_success_total,
-        "processed_by_operator": _sorted_items(per_processed_by_op),
-        "incoming_by_operator": _sorted_items(per_incoming_by_op),
-        "outgoing_by_operator": _sorted_items(per_outgoing_by_op),
+        "outgoing_success_10_total": outgoing_success_10_total,
+        # по операторам
+        "incoming_total_by_op": _sorted(per_in_total),
+        "outgoing_total_by_op": _sorted(per_out_total),
+        "incoming_answered_by_op": _sorted(per_in_answered),
+        "outgoing_success_10_by_op": _sorted(per_out_success_10),
+        "processed_by_operator": _sorted(per_processed),
     }
 
 def format_telephony_summary(t: Dict[str, Any]) -> str:
     m = t["meta"]
-    lines = []
-    lines.append("📞 <b>Телефонія</b>")
-    lines.append(f"🧾 Записів (за день): <b>{m['fetched']}</b> / {m['total']} · сторінок: {m['pages']}")
-    lines.append(f"🔕 Пропущених: <b>{t['missed_total']}</b>")
-    lines.append(f"📥 Вхідних (прийнятих): <b>{t['incoming_answered_total']}</b>")
-    lines.append(f"📤 Вихідних (успішних, ≥10s — з повторами): <b>{t['outgoing_success_total']}</b>")
-    lines.append("")
-    if t["processed_by_operator"]:
-        lines.append("👥 <b>Опрацьовано по операторам</b> (вхідні прийняті + вихідні успішні):")
-        for name, cnt in t["processed_by_operator"]:
-            lines.append(f"• {name}: <b>{cnt}</b>")
-        lines.append("")
-    if t["incoming_by_operator"]:
-        lines.append("👥 <b>Вхідні (прийняті) по операторам</b>:")
-        for name, cnt in t["incoming_by_operator"]:
-            lines.append(f"• {name}: <b>{cnt}</b>")
-        lines.append("")
-    if t["outgoing_by_operator"]:
-        lines.append("👥 <b>Вихідні (успішні, ≥10s) по операторам</b>:")
-        for name, cnt in t["outgoing_by_operator"]:
-            lines.append(f"• {name}: <b>{cnt}</b>")
-        lines.append("")
-    lines.append("━━━━━━━━━━━━━━━")
-    return "\n".join(lines)
+    L: List[str] = []
+    L.append("📞 <b>Телефонія</b>")
+    L.append(f"🧾 Записів (за день): <b>{m['fetched']}</b> / {m['total']} · сторінок: {m['pages']}")
+    # ГОЛОВНІ — щоб збігалось з дашбордом у Бітріксі
+    L.append(f"📥 Вхідних (всього): <b>{t['incoming_total']}</b>")
+    L.append(f"📤 Вихідних (всього): <b>{t['outgoing_total']}</b>")
+    L.append("")
+    # Додатково — для контролю якості
+    L.append(f"✅ Вхідних (прийнятих): <b>{t['incoming_answered_total']}</b>")
+    L.append(f"🔕 Пропущених (із вхідних): <b>{t['missed_total']}</b>")
+    L.append(f"🎯 Вихідних успішних (≥10s): <b>{t['outgoing_success_10_total']}</b>")
+    L.append("")
+
+    if t["incoming_total_by_op"]:
+        L.append("👥 <b>Вхідні (всього) по операторам</b>:")
+        for name, cnt in t["incoming_total_by_op"]:
+            L.append(f"• {name}: <b>{cnt}</b>")
+        L.append("")
+    if t["outgoing_total_by_op"]:
+        L.append("👥 <b>Вихідні (всього) по операторам</b>:")
+        for name, cnt in t["outgoing_total_by_op"]:
+            L.append(f"• {name}: <b>{cnt}</b>")
+        L.append("")
+    # (не обовʼязково, але корисно мати під рукою)
+    if t["incoming_answered_by_op"]:
+        L.append("👥 Вхідні (прийняті) по операторам:")
+        for name, cnt in t["incoming_answered_by_op"]:
+            L.append(f"• {name}: <b>{cnt}</b>")
+        L.append("")
+    if t["outgoing_success_10_by_op"]:
+        L.append("👥 Вихідні успішні (≥10s) по операторам:")
+        for name, cnt in t["outgoing_success_10_by_op"]:
+            L.append(f"• {name}: <b>{cnt}</b>")
+        L.append("")
+
+    L.append("━━━━━━━━━━━━━━━")
+    return "\n".join(L)
 
 # ------------------------ Summary builder -----------------
 async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     label, frm_utc, to_utc, _, _ = _day_bounds(offset_days)
-
+    type_map = await get_deal_type_map()  # noqa: F841  (кешуємо)
     conn_type_ids = await _connection_type_ids()
-    c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
 
+    # A) Подали сьогодні (кат.0 exact + переміщення у бригади сьогодні)
+    c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
     created_c0_exact = await b24_list(
         "crm.deal.list",
         order={"ID": "DESC"},
@@ -358,6 +414,7 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     )
     created_conn = len(created_c0_exact) + len(created_to_brigades)
 
+    # B) Закрили сьогодні (по CLOSEDATE)
     closed_list = await b24_list(
         "crm.deal.list",
         order={"CLOSEDATE": "ASC"},
@@ -371,6 +428,7 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     )
     closed_conn = len(closed_list)
 
+    # C) Активні у бригадних
     active_open = await b24_list(
         "crm.deal.list",
         order={"ID": "DESC"},
@@ -385,13 +443,15 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     )
     active_conn = len(active_open)
 
+    # D) Категорія 0: "На конкретний день" та "Думають" (відкриті)
     exact_cnt = await _count_open_in_stage(0, c0_exact_stage, conn_type_ids)
     think_cnt = await _count_open_in_stage(0, c0_think_stage, conn_type_ids)
 
+    # E) Телефонія (Bitrix voximplant.statistic.get)
     telephony = await fetch_telephony_for_day(offset_days)
 
     log.info(
-        "[summary] created=%s (c0_exact=%s + to_brigades=%s), closed=%s, active=%s, exact=%s, think=%s, tel_fetched=%s",
+        "[summary] created=%s (c0_exact=%s + to_brigades=%s), closed=%s, active=%s, exact=%s, think=%s, tel_rows=%s",
         created_conn, len(created_c0_exact), len(created_to_brigades), closed_conn, active_conn, exact_cnt, think_cnt,
         telephony["meta"]["fetched"]
     )
