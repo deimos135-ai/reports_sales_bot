@@ -1,4 +1,4 @@
-# main.py — Fiber Reports + Telephony (Bitrix voximplant.statistic.get) — PAGING FIX
+# main.py — Fiber Reports + Telephony (Bitrix voximplant.statistic.get) — FIXED DIRECTION + DEDUP
 import asyncio, html, json, logging, os, re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple, DefaultDict
@@ -206,19 +206,18 @@ async def _count_open_in_stage(cat_id: int, stage_full: str, type_ids: Optional[
     return len(deals_fb)
 
 # ------------------------ Telephony helpers ---------------
-def _operator_name(pid: Any) -> str:
-    if pid is None:
-        return "Невідомий оператор"
-    sid = str(pid)
-    return OP_NAME.get(sid) or f"ID {sid}"
+MIN_OUT_DURATION = int(os.environ.get("MIN_OUT_DURATION", "10"))
 
 def _code_str(r: Dict[str, Any]) -> str:
-    raw = str(r.get("CALL_FAILED_CODE") or r.get("FAILED_CODE") or r.get("STATUS_CODE") or "").strip()
-    m = re.search(r"\d{3}", raw)
-    return m.group(0) if m else raw
+    for k in ("STATUS_CODE", "CALL_FAILED_CODE", "FAILED_CODE"):
+        raw = str(r.get(k) or "").strip()
+        if raw:
+            m = re.search(r"\d{3}", raw)
+            return m.group(0) if m else raw
+    return ""
 
 def _duration_sec(r: Dict[str, Any]) -> int:
-    for k in ("CALL_DURATION", "DURATION", "RECORD_DURATION"):
+    for k in ("RECORD_DURATION", "CALL_DURATION", "DURATION"):
         v = r.get(k)
         try:
             return int(v)
@@ -226,53 +225,73 @@ def _duration_sec(r: Dict[str, Any]) -> int:
             pass
     return 0
 
-def _rough_classify_counts(rows: List[Dict[str, Any]]) -> Tuple[int, int]:
-    inc = out = 0
-    for r in rows:
-        ct = r.get("CALL_TYPE")
-        cat = (r.get("CALL_CATEGORY") or "").lower()
-        if (isinstance(ct, int) and ct == 1) or (cat in {"external", "callback"}):
-            inc += 1
-        elif (isinstance(ct, int) and ct == 2) or (cat in {"outgoing"}):
-            out += 1
-    return inc, out
+def _norm_call_type(r: Dict[str, Any]) -> Optional[int]:
+    """
+    1 = inbound, 2 = outbound.
+    """
+    v = r.get("CALL_TYPE")
+    try:
+        vi = int(v)
+        if vi in (1, 2):
+            return vi
+    except Exception:
+        pass
+    cat = (r.get("CALL_CATEGORY") or "").strip().lower()
+    if cat in {"external", "callback"}:
+        return 1
+    if cat in {"outgoing"}:
+        return 2
+    return None
 
-class _DirMap:
-    def __init__(self, flip: bool):
-        self.flip = flip
-    def is_in(self, r: Dict[str, Any]) -> bool:
-        ct = r.get("CALL_TYPE"); cat = (r.get("CALL_CATEGORY") or "").lower()
-        if not self.flip:
-            if isinstance(ct, int):
-                return ct == 1
-            return cat in {"external", "callback"}
-        else:
-            if isinstance(ct, int):
-                return ct == 2
-            return cat in {"callback"}
-    def is_out(self, r: Dict[str, Any]) -> bool:
-        ct = r.get("CALL_TYPE"); cat = (r.get("CALL_CATEGORY") or "").lower()
-        if not self.flip:
-            if isinstance(ct, int):
-                return ct == 2
-            return cat in {"outgoing"}
-        else:
-            if isinstance(ct, int):
-                return ct == 1
-            return cat in {"external", "outgoing"}
+def _is_human_leg(r: Dict[str, Any]) -> bool:
+    """
+    Лишаємо лише «людські» ніжки: є реальний оператор і він не заборонений allowlist-ом
+    """
+    pid = r.get("PORTAL_USER_ID")
+    try:
+        pid_int = int(pid)
+    except Exception:
+        return False
+    if pid_int <= 0:
+        return False
+    if not _allowed_pid(pid_int):
+        return False
+    return True
+
+def _pick_better_leg(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Вибираємо найрепрезентативнішу ніжку одного виклику по оператору:
+    1) прийнята (code 200 & dur>0) > неприйнята
+    2) за рівних — більша тривалість
+    3) за рівних — новіший час
+    """
+    def key(r: Dict[str, Any]) -> Tuple[int, int, str]:
+        code_ok = 1 if _code_str(r) == "200" and _duration_sec(r) > 0 else 0
+        return (code_ok, _duration_sec(r), str(r.get("CALL_START_DATE") or ""))
+    return b if key(b) > key(a) else a
+
+def _operator_name(pid: Any) -> str:
+    if pid is None:
+        return "Невідомий оператор"
+    sid = str(pid)
+    return OP_NAME.get(sid) or f"ID {sid}"
 
 # ------------------------ Telephony (Bitrix) --------------
 async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
     label, _, _, start_local_iso, end_local_iso = _day_bounds(offset_days)
 
     select = [
-        "CALL_START_DATE", "CALL_DURATION", "CALL_FAILED_CODE",
-        "CALL_TYPE", "CALL_CATEGORY", "PORTAL_USER_ID"
+        "CALL_ID", "CALL_SESSION_ID",
+        "CALL_START_DATE",
+        "CALL_DURATION", "RECORD_DURATION", "STATUS_CODE", "CALL_FAILED_CODE", "FAILED_CODE",
+        "CALL_TYPE", "CALL_CATEGORY",
+        "PORTAL_USER_ID",
+        "PORTAL_NUMBER", "PHONE_NUMBER"
     ]
     flt = {">=CALL_START_DATE": start_local_iso, "<CALL_START_DATE": end_local_iso}
 
-    # --- правильне пагінування з next ---
-    rows: List[Dict[str, Any]] = []
+    # --- пагінація з next ---
+    all_rows: List[Dict[str, Any]] = []
     start: Any = 0
     pages = 0
     total_hint: Optional[int] = None
@@ -288,7 +307,7 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
             chunk = chunk["items"]
         if not isinstance(chunk, list):
             chunk = []
-        rows.extend(chunk)
+        all_rows.extend(chunk)
         pages += 1
         if total_hint is None and isinstance(data.get("total"), int):
             total_hint = data["total"]
@@ -298,21 +317,60 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
         start = nxt
         await asyncio.sleep(0.1)
 
-    log.info("[telephony] %s: fetched %s rows in %s pages (total=%s)", label, len(rows), pages, total_hint)
+    # 1) «людські» ніжки
+    rows = [r for r in all_rows if _is_human_leg(r)]
 
-    # Адаптивне визначення напрямку
-    rough_in, rough_out = _rough_classify_counts(rows)
-    flip = (rough_out == 0 and rough_in > 0) or (rough_in == 0 and rough_out > 0)
-    dirmap = _DirMap(flip)
+    # 2) нормалізація полів
+    for r in rows:
+        r["_dir"] = _norm_call_type(r)
+        r["_code"] = _code_str(r)
+        r["_dur"]  = _duration_sec(r)
 
-    # Лічильники
-    total_records = len(rows)
-    incoming_total = 0
-    outgoing_total = 0
+    # 3) дедуп по (CALL_ID, PORTAL_USER_ID) з фолбеком, якщо CALL_ID відсутній
+    dedup: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for r in rows:
+        cid = str(r.get("CALL_ID") or "")
+        pid = str(r.get("PORTAL_USER_ID") or "")
+        if not cid:
+            cid = f"{r.get('CALL_START_DATE')}-{r.get('PHONE_NUMBER')}-{r.get('PORTAL_NUMBER')}"
+        key = (cid, pid)
+        if key in dedup:
+            dedup[key] = _pick_better_leg(dedup[key], r)
+        else:
+            dedup[key] = r
 
-    incoming_answered_total = 0
+    legs = list(dedup.values())
+
+    # 4) агрегати (напрямок без flip)
+    incoming_total = sum(1 for r in legs if r["_dir"] == 1)
+    outgoing_total = sum(1 for r in legs if r["_dir"] == 2)
+
+    incoming_answered_total = sum(1 for r in legs if r["_dir"] == 1 and r["_code"] == "200" and r["_dur"] > 0)
+
+    # «пропущені» — по унікальних викликах, де жоден оператор не прийняв
+    callid_answered_in: Dict[str, bool] = defaultdict(bool)
+    for r in legs:
+        if r["_dir"] == 1:
+            cid = str(r.get("CALL_ID") or f"{r.get('CALL_START_DATE')}-{r.get('PHONE_NUMBER')}-{r.get('PORTAL_NUMBER')}")
+            if r["_code"] == "200" and r["_dur"] > 0:
+                callid_answered_in[cid] = True
     missed_total = 0
-    outgoing_success_10_total = 0
+    seen_callids = set()
+    for r in legs:
+        if r["_dir"] != 1:
+            continue
+        cid = str(r.get("CALL_ID") or f"{r.get('CALL_START_DATE')}-{r.get('PHONE_NUMBER')}-{r.get('PORTAL_NUMBER')}")
+        if cid in seen_callids:
+            continue
+        seen_callids.add(cid)
+        if not callid_answered_in.get(cid, False):
+            missed_total += 1
+
+    outgoing_success_10_total = sum(1 for r in legs if r["_dir"] == 2 and r["_code"] == "200" and r["_dur"] >= MIN_OUT_DURATION)
+
+    # 5) пер-операторні
+    def name_of(r: Dict[str, Any]) -> str:
+        return _operator_name(r.get("PORTAL_USER_ID"))
 
     per_processed: DefaultDict[str, int] = defaultdict(int)
     per_in_total: DefaultDict[str, int] = defaultdict(int)
@@ -320,37 +378,27 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
     per_out_total: DefaultDict[str, int] = defaultdict(int)
     per_out_success_10: DefaultDict[str, int] = defaultdict(int)
 
-    for r in rows:
-        pid = r.get("PORTAL_USER_ID")
-        if not _allowed_pid(pid):
-            continue
-        name = _operator_name(pid)
-        code = _code_str(r)
-        dur = _duration_sec(r)
-
-        if dirmap.is_in(r):
-            incoming_total += 1
-            per_in_total[name] += 1
-            if code == "200" and dur > 0:
-                incoming_answered_total += 1
-                per_in_answered[name] += 1
-                per_processed[name] += 1
-            else:
-                missed_total += 1
-
-        elif dirmap.is_out(r):
-            outgoing_total += 1
-            per_out_total[name] += 1
-            if code == "200" and dur >= 10:
-                outgoing_success_10_total += 1
-                per_out_success_10[name] += 1
-                per_processed[name] += 1
+    for r in legs:
+        nm = name_of(r)
+        if r["_dir"] == 1:
+            per_in_total[nm] += 1
+            if r["_code"] == "200" and r["_dur"] > 0:
+                per_in_answered[nm] += 1
+                per_processed[nm] += 1
+        elif r["_dir"] == 2:
+            per_out_total[nm] += 1
+            if r["_code"] == "200" and r["_dur"] >= MIN_OUT_DURATION:
+                per_out_success_10[nm] += 1
+                per_processed[nm] += 1
 
     def _sorted_items(d: Dict[str, int]) -> List[Tuple[str, int]]:
         return sorted(d.items(), key=lambda x: (-x[1], x[0]))
 
+    log.info("[telephony] %s: raw=%s, human_legs=%s, dedup_legs=%s, pages=%s (total_hint=%s)",
+             label, len(all_rows), len(rows), len(legs), pages, total_hint)
+
     return {
-        "total_records": total_records,
+        "total_records": len(all_rows),      # сирих рядків
         "pages": pages,
         "total_hint": total_hint,
 
@@ -366,7 +414,8 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
         "per_in_answered": _sorted_items(per_in_answered),
         "per_out_total": _sorted_items(per_out_total),
         "per_out_success_10": _sorted_items(per_out_success_10),
-        "flip_used": flip,
+
+        "flip_used": False,   # більше не застосовується
     }
 
 def format_telephony_summary(t: Dict[str, Any]) -> str:
@@ -381,7 +430,7 @@ def format_telephony_summary(t: Dict[str, Any]) -> str:
     lines.append("")
     lines.append(f"✅ Вхідних (прийнятих): <b>{t['incoming_answered_total']}</b>")
     lines.append(f"🔕 Пропущених (із вхідних): <b>{t['missed_total']}</b>")
-    lines.append(f"🎯 Вихідних успішних (≥10s): <b>{t['outgoing_success_10_total']}</b>")
+    lines.append(f"🎯 Вихідних успішних (≥{MIN_OUT_DURATION}s): <b>{t['outgoing_success_10_total']}</b>")
     lines.append("")
     if t["per_processed"]:
         lines.append("👥 Опрацьовано (вхідні прийняті + вихідні успішні):")
@@ -389,7 +438,7 @@ def format_telephony_summary(t: Dict[str, Any]) -> str:
             lines.append(f"• {name}: <b>{cnt}</b>")
         lines.append("")
     if t["per_out_success_10"]:
-        lines.append("👥 Вихідні (успішні, ≥10s) по операторам:")
+        lines.append(f"👥 Вихідні (успішні, ≥{MIN_OUT_DURATION}s) по операторам:")
         for name, cnt in t["per_out_success_10"]:
             lines.append(f"• {name}: <b>{cnt}</b>")
         lines.append("")
