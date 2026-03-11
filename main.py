@@ -319,17 +319,18 @@ def _sorted_items(d: Dict[str, int]) -> List[Tuple[str, int]]:
     return sorted(d.items(), key=lambda x: (-x[1], x[0]))
 
 def _compact_operator_rows(t: Dict[str, Any]) -> List[Tuple[str, int, int, int, int]]:
-    per_in = dict(t.get("per_in_total", []))
+    per_in_raw = dict(t.get("per_in_total", []))
     per_out = dict(t.get("per_out_total", []))
     per_missed = dict(t.get("per_missed", []))
 
-    all_names = set(per_in) | set(per_out) | set(per_missed)
+    all_names = set(per_in_raw) | set(per_out) | set(per_missed)
 
     rows = []
     for name in all_names:
-        incoming = per_in.get(name, 0)
-        outgoing = per_out.get(name, 0)
+        incoming_raw = per_in_raw.get(name, 0)
         missed = per_missed.get(name, 0)
+        incoming = max(0, incoming_raw - missed)   # як у Bitrix
+        outgoing = per_out.get(name, 0)
         total = incoming + outgoing + missed
         rows.append((name, incoming, outgoing, missed, total))
 
