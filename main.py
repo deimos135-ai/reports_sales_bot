@@ -494,6 +494,7 @@ def format_telephony_summary(t: Dict[str, Any]) -> str:
     else:
         lines.append(f"🧾 Записів (за день): <b>{t['total_records']}</b> · сторінок: {t['pages']}")
 
+    lines.append("")
     lines.append(f"📥 Вхідних (всього): <b>{t['incoming_total']}</b>")
     lines.append(f"📤 Вихідних (всього): <b>{t['outgoing_total']}</b>")
     lines.append("")
@@ -505,12 +506,16 @@ def format_telephony_summary(t: Dict[str, Any]) -> str:
     if op_rows:
         lines.append("")
         lines.append("👥 <b>По операторам</b>")
-        for name, incoming, outgoing, missed, total in op_rows:
-            lines.append(
-                f"• {name}: "
-                f"📥 {incoming} · 📤 {outgoing} · 🔕 {missed} · Σ <b>{total}</b>"
-            )
 
+        for name, incoming, outgoing, missed, total in op_rows:
+            lines.append("")
+            lines.append(f"<b>{name}</b>")
+            lines.append(f"📥 Вхідні: <b>{incoming}</b>")
+            lines.append(f"📤 Вихідні: <b>{outgoing}</b>")
+            lines.append(f"🔕 Пропущені: <b>{missed}</b>")
+            lines.append(f"Σ Всього: <b>{total}</b>")
+
+    lines.append("")
     lines.append("━━━━━━━━━━━━━━━")
     return "\n".join(lines)
 
