@@ -1,7 +1,14 @@
-# main.py — Fiber Reports + Telephony (Bitrix voximplant.statistic.get) — FIXED DIRECTION + DEDUP
-import asyncio, html, json, logging, os, re
+# main.py — Fiber Reports + Telephony (Bitrix voximplant.statistic.get)
+# REWORKED: call-based telephony aggregation instead of leg-based counting
+
+import asyncio
+import html
+import json
+import logging
+import os
+import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple, DefaultDict
+from typing import Any, Dict, List, Optional, Tuple, DefaultDict, Set
 from collections import defaultdict
 
 import aiohttp
@@ -86,14 +93,16 @@ async def b24_raw(method: str, **params) -> Dict[str, Any]:
             async with HTTP.post(url, json=params) as resp:
                 data = await resp.json()
                 if "error" in data:
-                    err = data["error"]; desc = data.get("error_description")
+                    err = data["error"]
+                    desc = data.get("error_description")
                     if err in ("QUERY_LIMIT_EXCEEDED", "TOO_MANY_REQUESTS", "INTERNAL_SERVER_ERROR"):
-                        log.warning("Bitrix temp error: %s (%s), retry #%s", err, desc, attempt+1)
-                        await _sleep_backoff(attempt); continue
+                        log.warning("Bitrix temp error: %s (%s), retry #%s", err, desc, attempt + 1)
+                        await _sleep_backoff(attempt)
+                        continue
                     raise RuntimeError(f"B24 error: {err}: {desc}")
                 return data
         except aiohttp.ClientError as e:
-            log.warning("Bitrix network error: %s, retry #%s", e, attempt+1)
+            log.warning("Bitrix network error: %s, retry #%s", e, attempt + 1)
             await _sleep_backoff(attempt)
     raise RuntimeError("Bitrix request failed after retries")
 
@@ -113,7 +122,8 @@ async def b24_list(method: str, *, throttle: float = 0.12, **params) -> List[Dic
     total_known = None
 
     while True:
-        payload = dict(params); payload["start"] = start
+        payload = dict(params)
+        payload["start"] = start
         data = await b24_raw(method, **payload)
         result = data.get("result", [])
         if isinstance(result, dict) and "items" in result:
@@ -129,13 +139,15 @@ async def b24_list(method: str, *, throttle: float = 0.12, **params) -> List[Dic
         if nxt is None:
             break
         start = nxt
-        if throttle: await asyncio.sleep(throttle)
+        if throttle:
+            await asyncio.sleep(throttle)
 
     log.info("[b24_list] %s: fetched %s rows in %s pages (total=%s)", method, len(out), pages, total_known)
     return out
 
 # ------------------------ Caches / mappings ---------------
 _DEAL_TYPE_MAP: Optional[Dict[str, str]] = None
+
 async def get_deal_type_map() -> Dict[str, str]:
     global _DEAL_TYPE_MAP
     if _DEAL_TYPE_MAP is None:
@@ -167,8 +179,10 @@ def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str, str, str]:
     now_local = datetime.now(REPORT_TZ)
     start_local = (now_local - timedelta(days=offset_days)).replace(hour=0, minute=0, second=0, microsecond=0)
     end_local = start_local + timedelta(days=1)
+
     def _fmt_local(dt: datetime) -> str:
         return dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+
     start_utc = start_local.astimezone(timezone.utc).isoformat()
     end_utc = end_local.astimezone(timezone.utc).isoformat()
     label = start_local.strftime("%d.%m.%Y")
@@ -176,6 +190,7 @@ def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str, str, str]:
 
 # ------------------------ CAT0 stage resolving ------------
 _CAT0_STAGES: Optional[Dict[str, str]] = None
+
 async def _cat0_stages() -> Dict[str, str]:
     global _CAT0_STAGES
     if _CAT0_STAGES is None:
@@ -186,20 +201,27 @@ async def _cat0_stages() -> Dict[str, str]:
 
 async def _resolve_cat0_stage_ids() -> Tuple[str, str]:
     st = await _cat0_stages()
-    exact_id = None; think_id = None
+    exact_id = None
+    think_id = None
     for sid, nm in st.items():
         n = (nm or "").strip().lower()
-        if n == "на конкретний день": exact_id = sid
-        if n == "думають": think_id = sid
-    if not exact_id: exact_id = "5"
-    if not think_id: think_id = "DETAILS"
+        if n == "на конкретний день":
+            exact_id = sid
+        if n == "думають":
+            think_id = sid
+    if not exact_id:
+        exact_id = "5"
+    if not think_id:
+        think_id = "DETAILS"
     return f"C0:{exact_id}", f"C0:{think_id}"
 
 async def _count_open_in_stage(cat_id: int, stage_full: str, type_ids: Optional[List[str]] = None) -> int:
     flt: Dict[str, Any] = {"CLOSED": "N", "CATEGORY_ID": cat_id, "STAGE_ID": stage_full}
-    if type_ids: flt["TYPE_ID"] = type_ids
+    if type_ids:
+        flt["TYPE_ID"] = type_ids
     deals = await b24_list("crm.deal.list", order={"ID": "DESC"}, filter=flt, select=["ID"])
-    if deals: return len(deals)
+    if deals:
+        return len(deals)
     short = stage_full.split(":", 1)[-1]
     flt["STAGE_ID"] = short
     deals_fb = await b24_list("crm.deal.list", order={"ID": "DESC"}, filter=flt, select=["ID"])
@@ -227,25 +249,21 @@ def _duration_sec(r: Dict[str, Any]) -> int:
 
 def _norm_call_type(r: Dict[str, Any]) -> Optional[int]:
     """
-    1 = inbound, 2 = outbound.
+    Використовуємо ТІЛЬКИ CALL_TYPE:
+    1 = inbound
+    2 = outbound
     """
-    v = r.get("CALL_TYPE")
     try:
-        vi = int(v)
-        if vi in (1, 2):
-            return vi
+        v = int(r.get("CALL_TYPE"))
+        if v in (1, 2):
+            return v
     except Exception:
         pass
-    cat = (r.get("CALL_CATEGORY") or "").strip().lower()
-    if cat in {"external", "callback"}:
-        return 1
-    if cat in {"outgoing"}:
-        return 2
     return None
 
 def _is_human_leg(r: Dict[str, Any]) -> bool:
     """
-    Лишаємо лише «людські» ніжки: є реальний оператор і він не заборонений allowlist-ом
+    Лишаємо лише людські ніжки з реальним оператором.
     """
     pid = r.get("PORTAL_USER_ID")
     try:
@@ -258,49 +276,107 @@ def _is_human_leg(r: Dict[str, Any]) -> bool:
         return False
     return True
 
-def _pick_better_leg(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Вибираємо найрепрезентативнішу ніжку одного виклику по оператору:
-    1) прийнята (code 200 & dur>0) > неприйнята
-    2) за рівних — більша тривалість
-    3) за рівних — новіший час
-    """
-    def key(r: Dict[str, Any]) -> Tuple[int, int, str]:
-        code_ok = 1 if _code_str(r) == "200" and _duration_sec(r) > 0 else 0
-        return (code_ok, _duration_sec(r), str(r.get("CALL_START_DATE") or ""))
-    return b if key(b) > key(a) else a
-
 def _operator_name(pid: Any) -> str:
     if pid is None:
         return "Невідомий оператор"
     sid = str(pid)
     return OP_NAME.get(sid) or f"ID {sid}"
 
+def _call_uid(r: Dict[str, Any]) -> str:
+    """
+    Стабільний ID дзвінка.
+    Спочатку CALL_ID, потім CALL_SESSION_ID, далі fallback.
+    """
+    call_id = str(r.get("CALL_ID") or "").strip()
+    if call_id:
+        return f"cid:{call_id}"
+
+    sess_id = str(r.get("CALL_SESSION_ID") or "").strip()
+    if sess_id:
+        return f"sid:{sess_id}"
+
+    return "fb:{start}|{phone}|{portal}|{pid}".format(
+        start=str(r.get("CALL_START_DATE") or "").strip(),
+        phone=str(r.get("PHONE_NUMBER") or "").strip(),
+        portal=str(r.get("PORTAL_NUMBER") or "").strip(),
+        pid=str(r.get("PORTAL_USER_ID") or "").strip(),
+    )
+
+def _row_dt_str(r: Dict[str, Any]) -> str:
+    return str(r.get("CALL_START_DATE") or "")
+
+def _is_answered_inbound_leg(r: Dict[str, Any]) -> bool:
+    return r.get("_dir") == 1 and r.get("_code") == "200" and int(r.get("_dur") or 0) > 0
+
+def _is_success_outbound_leg(r: Dict[str, Any]) -> bool:
+    return r.get("_dir") == 2 and r.get("_code") == "200" and int(r.get("_dur") or 0) >= MIN_OUT_DURATION
+
+def _pick_best_answered_leg(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Для вхідного прийнятого дзвінка знайти найкращу операторську ніжку.
+    """
+    answered = [r for r in rows if _is_answered_inbound_leg(r)]
+    if not answered:
+        return None
+    answered.sort(key=lambda r: (int(r["_dur"]), _row_dt_str(r)), reverse=True)
+    return answered[0]
+
+def _pick_best_outbound_leg(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Для вихідного дзвінка беремо найрепрезентативнішу ніжку.
+    """
+    valid = [r for r in rows if r.get("_dir") == 2]
+    if not valid:
+        return None
+    valid.sort(
+        key=lambda r: (
+            1 if _is_success_outbound_leg(r) else 0,
+            int(r["_dur"]),
+            _row_dt_str(r)
+        ),
+        reverse=True,
+    )
+    return valid[0]
+
+def _sorted_items(d: Dict[str, int]) -> List[Tuple[str, int]]:
+    return sorted(d.items(), key=lambda x: (-x[1], x[0]))
+
 # ------------------------ Telephony (Bitrix) --------------
 async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
     label, _, _, start_local_iso, end_local_iso = _day_bounds(offset_days)
 
     select = [
-        "CALL_ID", "CALL_SESSION_ID",
+        "CALL_ID",
+        "CALL_SESSION_ID",
         "CALL_START_DATE",
-        "CALL_DURATION", "RECORD_DURATION", "STATUS_CODE", "CALL_FAILED_CODE", "FAILED_CODE",
-        "CALL_TYPE", "CALL_CATEGORY",
+        "CALL_DURATION",
+        "RECORD_DURATION",
+        "STATUS_CODE",
+        "CALL_FAILED_CODE",
+        "FAILED_CODE",
+        "CALL_TYPE",
+        "CALL_CATEGORY",
         "PORTAL_USER_ID",
-        "PORTAL_NUMBER", "PHONE_NUMBER"
+        "PORTAL_NUMBER",
+        "PHONE_NUMBER",
     ]
-    flt = {">=CALL_START_DATE": start_local_iso, "<CALL_START_DATE": end_local_iso}
+    flt = {
+        ">=CALL_START_DATE": start_local_iso,
+        "<CALL_START_DATE": end_local_iso,
+    }
 
     # --- пагінація з next ---
     all_rows: List[Dict[str, Any]] = []
     start: Any = 0
     pages = 0
     total_hint: Optional[int] = None
+
     while True:
         data = await b24_raw(
             "voximplant.statistic.get",
             filter=flt,
             select=select,
-            start=start
+            start=start,
         )
         chunk = data.get("result", [])
         if isinstance(chunk, dict) and "items" in chunk:
@@ -317,88 +393,118 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
         start = nxt
         await asyncio.sleep(0.1)
 
-    # 1) «людські» ніжки
+    # Лише людські ніжки
     rows = [r for r in all_rows if _is_human_leg(r)]
 
-    # 2) нормалізація полів
+    # Нормалізація
     for r in rows:
+        r["_uid"] = _call_uid(r)
         r["_dir"] = _norm_call_type(r)
         r["_code"] = _code_str(r)
-        r["_dur"]  = _duration_sec(r)
+        r["_dur"] = _duration_sec(r)
+        r["_op_name"] = _operator_name(r.get("PORTAL_USER_ID"))
 
-    # 3) дедуп по (CALL_ID, PORTAL_USER_ID) з фолбеком, якщо CALL_ID відсутній
-    dedup: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    # Групування по дзвінку
+    calls: DefaultDict[str, List[Dict[str, Any]]] = defaultdict(list)
     for r in rows:
-        cid = str(r.get("CALL_ID") or "")
-        pid = str(r.get("PORTAL_USER_ID") or "")
-        if not cid:
-            cid = f"{r.get('CALL_START_DATE')}-{r.get('PHONE_NUMBER')}-{r.get('PORTAL_NUMBER')}"
-        key = (cid, pid)
-        if key in dedup:
-            dedup[key] = _pick_better_leg(dedup[key], r)
-        else:
-            dedup[key] = r
+        if r["_dir"] in (1, 2):
+            calls[r["_uid"]].append(r)
 
-    legs = list(dedup.values())
-
-    # 4) агрегати (напрямок без flip)
-    incoming_total = sum(1 for r in legs if r["_dir"] == 1)
-    outgoing_total = sum(1 for r in legs if r["_dir"] == 2)
-
-    incoming_answered_total = sum(1 for r in legs if r["_dir"] == 1 and r["_code"] == "200" and r["_dur"] > 0)
-
-    # «пропущені» — по унікальних викликах, де жоден оператор не прийняв
-    callid_answered_in: Dict[str, bool] = defaultdict(bool)
-    for r in legs:
-        if r["_dir"] == 1:
-            cid = str(r.get("CALL_ID") or f"{r.get('CALL_START_DATE')}-{r.get('PHONE_NUMBER')}-{r.get('PORTAL_NUMBER')}")
-            if r["_code"] == "200" and r["_dur"] > 0:
-                callid_answered_in[cid] = True
+    incoming_total = 0
+    outgoing_total = 0
+    incoming_answered_total = 0
     missed_total = 0
-    seen_callids = set()
-    for r in legs:
-        if r["_dir"] != 1:
-            continue
-        cid = str(r.get("CALL_ID") or f"{r.get('CALL_START_DATE')}-{r.get('PHONE_NUMBER')}-{r.get('PORTAL_NUMBER')}")
-        if cid in seen_callids:
-            continue
-        seen_callids.add(cid)
-        if not callid_answered_in.get(cid, False):
-            missed_total += 1
+    outgoing_success_10_total = 0
 
-    outgoing_success_10_total = sum(1 for r in legs if r["_dir"] == 2 and r["_code"] == "200" and r["_dur"] >= MIN_OUT_DURATION)
-
-    # 5) пер-операторні
-    def name_of(r: Dict[str, Any]) -> str:
-        return _operator_name(r.get("PORTAL_USER_ID"))
-
+    # Пер-операторні метрики
     per_processed: DefaultDict[str, int] = defaultdict(int)
     per_in_total: DefaultDict[str, int] = defaultdict(int)
     per_in_answered: DefaultDict[str, int] = defaultdict(int)
     per_out_total: DefaultDict[str, int] = defaultdict(int)
     per_out_success_10: DefaultDict[str, int] = defaultdict(int)
+    per_missed: DefaultDict[str, int] = defaultdict(int)
 
-    for r in legs:
-        nm = name_of(r)
-        if r["_dir"] == 1:
-            per_in_total[nm] += 1
-            if r["_code"] == "200" and r["_dur"] > 0:
-                per_in_answered[nm] += 1
-                per_processed[nm] += 1
-        elif r["_dir"] == 2:
-            per_out_total[nm] += 1
-            if r["_code"] == "200" and r["_dur"] >= MIN_OUT_DURATION:
-                per_out_success_10[nm] += 1
-                per_processed[nm] += 1
+    debug_samples: List[str] = []
 
-    def _sorted_items(d: Dict[str, int]) -> List[Tuple[str, int]]:
-        return sorted(d.items(), key=lambda x: (-x[1], x[0]))
+    for uid, grp in calls.items():
+        dirs = {r["_dir"] for r in grp if r["_dir"] in (1, 2)}
+        if not dirs:
+            continue
 
-    log.info("[telephony] %s: raw=%s, human_legs=%s, dedup_legs=%s, pages=%s (total_hint=%s)",
-             label, len(all_rows), len(rows), len(legs), pages, total_hint)
+        # Якщо Bitrix раптом віддав змішану сесію - беремо домінуючий напрямок
+        if len(dirs) == 1:
+            call_dir = next(iter(dirs))
+        else:
+            cnt1 = sum(1 for r in grp if r["_dir"] == 1)
+            cnt2 = sum(1 for r in grp if r["_dir"] == 2)
+            call_dir = 1 if cnt1 >= cnt2 else 2
+
+        op_names: Set[str] = {r["_op_name"] for r in grp}
+
+        if call_dir == 1:
+            incoming_total += 1
+
+            best_answered = _pick_best_answered_leg(grp)
+            if best_answered is not None:
+                incoming_answered_total += 1
+                op = best_answered["_op_name"]
+                per_in_total[op] += 1
+                per_in_answered[op] += 1
+                per_processed[op] += 1
+            else:
+                missed_total += 1
+                # Пропущений вхідний відносимо на операторів, які мали цю сесію
+                # щоб у таблиці операторів було видно missed.
+                for op in sorted(op_names):
+                    per_in_total[op] += 1
+                    per_missed[op] += 1
+
+            if len(debug_samples) < 5:
+                debug_samples.append(
+                    f"IN {uid}: legs={len(grp)}, answered={'yes' if best_answered else 'no'}, "
+                    f"ops={sorted(op_names)}"
+                )
+
+        elif call_dir == 2:
+            outgoing_total += 1
+            best_out = _pick_best_outbound_leg(grp)
+            if best_out is not None:
+                op = best_out["_op_name"]
+                per_out_total[op] += 1
+                if _is_success_outbound_leg(best_out):
+                    outgoing_success_10_total += 1
+                    per_out_success_10[op] += 1
+                    per_processed[op] += 1
+
+            if len(debug_samples) < 10:
+                debug_samples.append(
+                    f"OUT {uid}: legs={len(grp)}, best={best_out['_op_name'] if best_out else '-'}, "
+                    f"dur={best_out['_dur'] if best_out else '-'}, ok={'yes' if best_out and _is_success_outbound_leg(best_out) else 'no'}"
+                )
+
+    log.info(
+        "[telephony] %s: raw=%s, human_legs=%s, calls=%s, pages=%s (total_hint=%s) "
+        "in=%s out=%s in_ans=%s missed=%s out_ok=%s",
+        label,
+        len(all_rows),
+        len(rows),
+        len(calls),
+        pages,
+        total_hint,
+        incoming_total,
+        outgoing_total,
+        incoming_answered_total,
+        missed_total,
+        outgoing_success_10_total,
+    )
+
+    for s in debug_samples:
+        log.info("[telephony.debug] %s", s)
 
     return {
-        "total_records": len(all_rows),      # сирих рядків
+        "total_records": len(all_rows),   # сирі рядки
+        "human_legs": len(rows),          # людські ніжки
+        "unique_calls": len(calls),       # унікальні дзвінки
         "pages": pages,
         "total_hint": total_hint,
 
@@ -414,17 +520,25 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
         "per_in_answered": _sorted_items(per_in_answered),
         "per_out_total": _sorted_items(per_out_total),
         "per_out_success_10": _sorted_items(per_out_success_10),
+        "per_missed": _sorted_items(per_missed),
 
-        "flip_used": False,   # більше не застосовується
+        "flip_used": False,
     }
 
 def format_telephony_summary(t: Dict[str, Any]) -> str:
     lines = []
     lines.append("📞 <b>Телефонія</b>")
     if t.get("total_hint"):
-        lines.append(f"🧾 Записів (за день): <b>{t['total_records']}</b> / {t['total_hint']} · сторінок: {t['pages']}")
+        lines.append(
+            f"🧾 Записів (за день): <b>{t['total_records']}</b> / {t['total_hint']} · "
+            f"людських ніжок: {t.get('human_legs', 0)} · дзвінків: {t.get('unique_calls', 0)} · сторінок: {t['pages']}"
+        )
     else:
-        lines.append(f"🧾 Записів (за день): <b>{t['total_records']}</b> · сторінок: {t['pages']}")
+        lines.append(
+            f"🧾 Записів (за день): <b>{t['total_records']}</b> · "
+            f"людських ніжок: {t.get('human_legs', 0)} · дзвінків: {t.get('unique_calls', 0)} · сторінок: {t['pages']}"
+        )
+
     lines.append(f"📥 Вхідних (всього): <b>{t['incoming_total']}</b>")
     lines.append(f"📤 Вихідних (всього): <b>{t['outgoing_total']}</b>")
     lines.append("")
@@ -432,28 +546,46 @@ def format_telephony_summary(t: Dict[str, Any]) -> str:
     lines.append(f"🔕 Пропущених (із вхідних): <b>{t['missed_total']}</b>")
     lines.append(f"🎯 Вихідних успішних (≥{MIN_OUT_DURATION}s): <b>{t['outgoing_success_10_total']}</b>")
     lines.append("")
+
     if t["per_processed"]:
         lines.append("👥 Опрацьовано (вхідні прийняті + вихідні успішні):")
         for name, cnt in t["per_processed"]:
             lines.append(f"• {name}: <b>{cnt}</b>")
         lines.append("")
+
+    if t["per_out_total"]:
+        lines.append("👥 Вихідні (всього) по операторам:")
+        for name, cnt in t["per_out_total"]:
+            lines.append(f"• {name}: <b>{cnt}</b>")
+        lines.append("")
+
     if t["per_out_success_10"]:
         lines.append(f"👥 Вихідні (успішні, ≥{MIN_OUT_DURATION}s) по операторам:")
         for name, cnt in t["per_out_success_10"]:
             lines.append(f"• {name}: <b>{cnt}</b>")
         lines.append("")
+
     if t["per_in_total"]:
         lines.append("👥 Вхідні (всього) по операторам:")
         for name, cnt in t["per_in_total"]:
             lines.append(f"• {name}: <b>{cnt}</b>")
         lines.append("")
+
     if t["per_in_answered"]:
         lines.append("👥 Вхідні (прийняті) по операторам:")
         for name, cnt in t["per_in_answered"]:
             lines.append(f"• {name}: <b>{cnt}</b>")
         lines.append("")
+
+    if t.get("per_missed"):
+        lines.append("👥 Пропущені вхідні по операторам:")
+        for name, cnt in t["per_missed"]:
+            lines.append(f"• {name}: <b>{cnt}</b>")
+        lines.append("")
+
     if t.get("flip_used"):
         lines.append("🛠 Застосовано адаптивне мапінг-напрямків (flip)")
+
     lines.append("━━━━━━━━━━━━━━━")
     return "\n".join(lines)
 
@@ -464,6 +596,7 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     conn_type_ids = await _connection_type_ids()
 
     c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
+
     created_c0_exact = await b24_list(
         "crm.deal.list",
         order={"ID": "DESC"},
@@ -471,10 +604,12 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
             "CATEGORY_ID": 0,
             "STAGE_ID": c0_exact_stage,
             "TYPE_ID": conn_type_ids,
-            ">=DATE_CREATE": frm_utc, "<DATE_CREATE": to_utc,
+            ">=DATE_CREATE": frm_utc,
+            "<DATE_CREATE": to_utc,
         },
-        select=["ID"]
+        select=["ID"],
     )
+
     created_to_brigades = await b24_list(
         "crm.deal.list",
         order={"DATE_MODIFY": "ASC"},
@@ -482,9 +617,10 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
             "CATEGORY_ID": 20,
             "STAGE_ID": list(_BRIGADE_STAGE_FULL),
             "TYPE_ID": conn_type_ids,
-            ">=DATE_MODIFY": frm_utc, "<DATE_MODIFY": to_utc,
+            ">=DATE_MODIFY": frm_utc,
+            "<DATE_MODIFY": to_utc,
         },
-        select=["ID"]
+        select=["ID"],
     )
     created_conn = len(created_c0_exact) + len(created_to_brigades)
 
@@ -495,9 +631,10 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
             "CATEGORY_ID": 20,
             "STAGE_ID": "C20:WON",
             "TYPE_ID": conn_type_ids,
-            ">=CLOSEDATE": frm_utc, "<CLOSEDATE": to_utc,
+            ">=CLOSEDATE": frm_utc,
+            "<CLOSEDATE": to_utc,
         },
-        select=["ID"]
+        select=["ID"],
     )
     closed_conn = len(closed_list)
 
@@ -511,7 +648,7 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
             "TYPE_ID": conn_type_ids,
             "STAGE_SEMANTIC_ID": "P",
         },
-        select=["ID"]
+        select=["ID"],
     )
     active_conn = len(active_open)
 
@@ -522,8 +659,15 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
 
     log.info(
         "[summary] created=%s (c0_exact=%s + to_brigades=%s), closed=%s, active=%s, exact=%s, think=%s, tel_total=%s pages=%s",
-        created_conn, len(created_c0_exact), len(created_to_brigades), closed_conn, active_conn, exact_cnt, think_cnt,
-        telephony["total_records"], telephony["pages"]
+        created_conn,
+        len(created_c0_exact),
+        len(created_to_brigades),
+        closed_conn,
+        active_conn,
+        exact_cnt,
+        think_cnt,
+        telephony["total_records"],
+        telephony["pages"],
     )
 
     return {
@@ -535,7 +679,9 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
 
 def format_company_summary(d: Dict[str, Any]) -> str:
     dl = d["date_label"]
-    c = d["connections"]; c0 = d["cat0"]; t = d["telephony"]
+    c = d["connections"]
+    c0 = d["cat0"]
+    t = d["telephony"]
 
     parts = []
     parts.append(f"🗓 <b>Дата: {dl}</b>")
@@ -567,7 +713,7 @@ async def _safe_send(chat_id: int, text: str):
                 except Exception:
                     retry_after = None
             wait = retry_after if retry_after else min(30, 2 ** attempt)
-            log.warning("telegram send failed: %s, waiting %ss (try #%s)", e, wait, attempt+1)
+            log.warning("telegram send failed: %s, waiting %ss (try #%s)", e, wait, attempt + 1)
             await asyncio.sleep(wait)
     log.error("telegram send failed permanently (chat %s)", chat_id)
 
@@ -608,7 +754,8 @@ def _next_run_dt(now_utc: datetime) -> datetime:
     hh, mm = map(int, REPORT_TIME.split(":", 1))
     now_local = now_utc.astimezone(REPORT_TZ)
     target_local = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    if target_local <= now_local: target_local += timedelta(days=1)
+    if target_local <= now_local:
+        target_local += timedelta(days=1)
     return target_local.astimezone(timezone.utc)
 
 async def scheduler_loop():
