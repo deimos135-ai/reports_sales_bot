@@ -249,14 +249,21 @@ def _duration_sec(r: Dict[str, Any]) -> int:
 
 def _norm_call_type(r: Dict[str, Any]) -> Optional[int]:
     """
-    Використовуємо ТІЛЬКИ CALL_TYPE:
-    1 = inbound
-    2 = outbound
+    Для цього порталу Bitrix:
+    raw CALL_TYPE:
+      1 = outbound
+      2 = inbound
+
+    Нормалізуємо до нашого формату:
+      1 = inbound
+      2 = outbound
     """
     try:
         v = int(r.get("CALL_TYPE"))
-        if v in (1, 2):
-            return v
+        if v == 1:
+            return 2
+        if v == 2:
+            return 1
     except Exception:
         pass
     return None
