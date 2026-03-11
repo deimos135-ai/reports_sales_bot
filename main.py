@@ -1,5 +1,6 @@
 # main.py — Fiber Reports + Telephony (Bitrix voximplant.statistic.get)
 # CLEAN VERSION: telephony aligned to Bitrix stat rows + cleaner Telegram output
+# UPDATED: supports Telegram forum topics via message_thread_id
 
 import asyncio
 import html
@@ -30,7 +31,8 @@ REPORT_TZ_NAME = os.environ.get("REPORT_TZ", "Europe/Kyiv")
 REPORT_TZ = ZoneInfo(REPORT_TZ_NAME)
 REPORT_TIME = os.environ.get("REPORT_TIME", "19:00")  # HH:MM
 
-REPORT_SUMMARY_CHAT = int(os.environ.get("REPORT_SUMMARY_CHAT", "0"))  # optional
+REPORT_SUMMARY_CHAT = int(os.environ.get("REPORT_SUMMARY_CHAT", "0"))  # group/supergroup id
+REPORT_SUMMARY_THREAD_ID = int(os.environ.get("REPORT_SUMMARY_THREAD_ID", "0"))  # topic/thread id
 MIN_OUT_DURATION = int(os.environ.get("MIN_OUT_DURATION", "10"))
 
 # Operators map (ENV has priority)
@@ -62,6 +64,7 @@ if _ALLOWED_RAW:
     except Exception:
         ALLOWED_IDS = None
 
+
 def _allowed_pid(pid: Any) -> bool:
     if ALLOWED_IDS is None:
         return True
@@ -69,6 +72,7 @@ def _allowed_pid(pid: Any) -> bool:
         return int(pid) in ALLOWED_IDS
     except Exception:
         return False
+
 
 # ------------------------ Logging -------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -88,6 +92,7 @@ async def healthz():
 # ------------------------ Bitrix helpers ------------------
 async def _sleep_backoff(attempt: int, base: float = 0.5, cap: float = 8.0):
     await asyncio.sleep(min(cap, base * (2 ** attempt)))
+
 
 async def b24_raw(method: str, **params) -> Dict[str, Any]:
     url = f"{BITRIX_WEBHOOK_BASE}/{method}.json"
@@ -109,9 +114,11 @@ async def b24_raw(method: str, **params) -> Dict[str, Any]:
             await _sleep_backoff(attempt)
     raise RuntimeError("Bitrix request failed after retries")
 
+
 async def b24(method: str, **params) -> Any:
     data = await b24_raw(method, **params)
     return data.get("result")
+
 
 async def b24_list(method: str, *, throttle: float = 0.12, **params) -> List[Dict[str, Any]]:
     start: Any = params.pop("start", 0)
@@ -143,9 +150,11 @@ async def b24_list(method: str, *, throttle: float = 0.12, **params) -> List[Dic
     log.info("[b24_list] %s: fetched %s rows in %s pages (total=%s)", method, len(out), pages, total_known)
     return out
 
+
 # ------------------------ Caches / mappings ---------------
 _DEAL_TYPE_MAP: Optional[Dict[str, str]] = None
 _CAT0_STAGES: Optional[Dict[str, str]] = None
+
 
 async def get_deal_type_map() -> Dict[str, str]:
     global _DEAL_TYPE_MAP
@@ -154,6 +163,7 @@ async def get_deal_type_map() -> Dict[str, str]:
         _DEAL_TYPE_MAP = {i["STATUS_ID"]: i["NAME"] for i in items}
         log.info("[cache] DEAL_TYPE: %s", len(_DEAL_TYPE_MAP))
     return _DEAL_TYPE_MAP
+
 
 def _is_connection(type_id: str, type_name: Optional[str] = None) -> bool:
     name = (type_name or "").strip().lower()
@@ -165,9 +175,11 @@ def _is_connection(type_id: str, type_name: Optional[str] = None) -> bool:
         or ("подключ" in name)
     )
 
+
 async def _connection_type_ids() -> List[str]:
     m = await get_deal_type_map()
     return [tid for tid, nm in m.items() if _is_connection(tid, nm)]
+
 
 async def _cat0_stages() -> Dict[str, str]:
     global _CAT0_STAGES
@@ -177,6 +189,7 @@ async def _cat0_stages() -> Dict[str, str]:
         log.info("[cache] CAT0 stages: %s", len(_CAT0_STAGES))
     return _CAT0_STAGES
 
+
 # Бригадні стадії в кат.20
 _BRIGADE_STAGE = {
     1: "UC_XF8O6V",
@@ -184,6 +197,8 @@ _BRIGADE_STAGE = {
     3: "UC_204CP3",
     4: "UC_TNEW3Z",
     5: "UC_RMBZ37",
+    6: "UC_CY6YW8",
+    7: "7",
 }
 _BRIGADE_STAGE_FULL = {f"C20:{v}" for v in _BRIGADE_STAGE.values()}
 
@@ -200,6 +215,7 @@ def _day_bounds(offset_days: int = 0) -> Tuple[str, str, str, str, str]:
     end_utc = end_local.astimezone(timezone.utc).isoformat()
     label = start_local.strftime("%d.%m.%Y")
     return label, start_utc, end_utc, _fmt_local(start_local), _fmt_local(end_local)
+
 
 async def _resolve_cat0_stage_ids() -> Tuple[str, str]:
     st = await _cat0_stages()
@@ -220,6 +236,7 @@ async def _resolve_cat0_stage_ids() -> Tuple[str, str]:
 
     return f"C0:{exact_id}", f"C0:{think_id}"
 
+
 async def _count_open_in_stage(cat_id: int, stage_full: str, type_ids: Optional[List[str]] = None) -> int:
     flt: Dict[str, Any] = {
         "CLOSED": "N",
@@ -238,6 +255,7 @@ async def _count_open_in_stage(cat_id: int, stage_full: str, type_ids: Optional[
     deals_fb = await b24_list("crm.deal.list", order={"ID": "DESC"}, filter=flt, select=["ID"])
     return len(deals_fb)
 
+
 # ------------------------ Telephony helpers ---------------
 def _code_str(r: Dict[str, Any]) -> str:
     for k in ("CALL_FAILED_CODE", "STATUS_CODE", "FAILED_CODE"):
@@ -247,6 +265,7 @@ def _code_str(r: Dict[str, Any]) -> str:
             return m.group(0) if m else raw
     return ""
 
+
 def _duration_sec(r: Dict[str, Any]) -> int:
     for k in ("RECORD_DURATION", "CALL_DURATION", "DURATION"):
         v = r.get(k)
@@ -255,6 +274,7 @@ def _duration_sec(r: Dict[str, Any]) -> int:
         except Exception:
             pass
     return 0
+
 
 def _norm_call_type(r: Dict[str, Any]) -> Optional[int]:
     """
@@ -277,6 +297,7 @@ def _norm_call_type(r: Dict[str, Any]) -> Optional[int]:
         pass
     return None
 
+
 def _operator_name(pid: Any) -> str:
     if pid is None:
         return "Без имени"
@@ -287,8 +308,10 @@ def _operator_name(pid: Any) -> str:
 
     return OP_NAME.get(sid) or f"ID {sid}"
 
+
 def _include_row_for_totals(r: Dict[str, Any]) -> bool:
     return r.get("_dir") in (1, 2)
+
 
 def _include_row_for_operator_stats(r: Dict[str, Any]) -> bool:
     pid = r.get("PORTAL_USER_ID")
@@ -315,8 +338,10 @@ def _include_row_for_operator_stats(r: Dict[str, Any]) -> bool:
 
     return True
 
+
 def _sorted_items(d: Dict[str, int]) -> List[Tuple[str, int]]:
     return sorted(d.items(), key=lambda x: (-x[1], x[0]))
+
 
 def _compact_operator_rows(t: Dict[str, Any]) -> List[Tuple[str, int, int, int, int]]:
     per_in_raw = dict(t.get("per_in_total", []))
@@ -329,13 +354,14 @@ def _compact_operator_rows(t: Dict[str, Any]) -> List[Tuple[str, int, int, int, 
     for name in all_names:
         incoming_raw = per_in_raw.get(name, 0)
         missed = per_missed.get(name, 0)
-        incoming = max(0, incoming_raw - missed)   # як у Bitrix
+        incoming = max(0, incoming_raw - missed)
         outgoing = per_out.get(name, 0)
         total = incoming + outgoing + missed
         rows.append((name, incoming, outgoing, missed, total))
 
     rows.sort(key=lambda x: (-x[4], x[0]))
     return rows
+
 
 # ------------------------ Telephony (Bitrix) --------------
 async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
@@ -485,6 +511,7 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
         "per_missed": _sorted_items(per_missed),
     }
 
+
 # ------------------------ Formatting ----------------------
 def format_telephony_summary(t: Dict[str, Any]) -> str:
     lines: List[str] = []
@@ -520,6 +547,7 @@ def format_telephony_summary(t: Dict[str, Any]) -> str:
     lines.append("━━━━━━━━━━━━━━━")
     return "\n".join(lines)
 
+
 def format_company_summary(d: Dict[str, Any]) -> str:
     dl = d["date_label"]
     c = d["connections"]
@@ -540,6 +568,7 @@ def format_company_summary(d: Dict[str, Any]) -> str:
     parts.append("━━━━━━━━━━━━━━━")
     parts.append(format_telephony_summary(t))
     return "\n".join(parts)
+
 
 # ------------------------ Summary builder -----------------
 async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
@@ -634,11 +663,17 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
         "telephony": telephony,
     }
 
+
 # ------------------------ Send helpers -------------------
-async def _safe_send(chat_id: int, text: str):
+async def _safe_send(chat_id: int, text: str, message_thread_id: Optional[int] = None):
     for attempt in range(7):
         try:
-            await bot.send_message(chat_id, text, disable_web_page_preview=True)
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                disable_web_page_preview=True,
+                message_thread_id=message_thread_id if message_thread_id else None,
+            )
             return
         except Exception as e:
             msg = str(e)
@@ -649,27 +684,46 @@ async def _safe_send(chat_id: int, text: str):
                 except Exception:
                     retry_after = None
             wait = retry_after if retry_after else min(30, 2 ** attempt)
-            log.warning("telegram send failed: %s, waiting %ss (try #%s)", e, wait, attempt + 1)
+            log.warning(
+                "telegram send failed: %s, waiting %ss (try #%s), chat=%s, thread=%s",
+                e, wait, attempt + 1, chat_id, message_thread_id
+            )
             await asyncio.sleep(wait)
 
-    log.error("telegram send failed permanently (chat %s)", chat_id)
+    log.error("telegram send failed permanently (chat %s, thread %s)", chat_id, message_thread_id)
 
-async def send_company_summary_to_chat(target_chat: int, offset_days: int = 0) -> None:
+
+async def send_company_summary_to_chat(
+    target_chat: int,
+    offset_days: int = 0,
+    message_thread_id: Optional[int] = None,
+) -> None:
     try:
         data = await build_company_summary(offset_days)
-        await _safe_send(target_chat, format_company_summary(data))
+        await _safe_send(
+            target_chat,
+            format_company_summary(data),
+            message_thread_id=message_thread_id,
+        )
     except Exception as e:
         log.exception("company summary failed for chat %s", target_chat)
         await _safe_send(
             target_chat,
             f"❗️Помилка формування сумарного звіту:\n<code>{html.escape(str(e))}</code>",
+            message_thread_id=message_thread_id,
         )
+
 
 async def send_company_summary(offset_days: int = 0) -> None:
     if REPORT_SUMMARY_CHAT:
-        await send_company_summary_to_chat(REPORT_SUMMARY_CHAT, offset_days)
+        await send_company_summary_to_chat(
+            REPORT_SUMMARY_CHAT,
+            offset_days,
+            message_thread_id=REPORT_SUMMARY_THREAD_ID or None,
+        )
     else:
         log.warning("REPORT_SUMMARY_CHAT is not configured")
+
 
 # ------------------------ Manual command -----------------
 @dp.message(Command("report_now"))
@@ -687,9 +741,14 @@ async def report_now(m: Message):
     await send_company_summary_to_chat(m.chat.id, offset)
 
     if REPORT_SUMMARY_CHAT and REPORT_SUMMARY_CHAT != m.chat.id:
-        await send_company_summary_to_chat(REPORT_SUMMARY_CHAT, offset)
+        await send_company_summary_to_chat(
+            REPORT_SUMMARY_CHAT,
+            offset,
+            message_thread_id=REPORT_SUMMARY_THREAD_ID or None,
+        )
 
     await m.answer("✅ Готово")
+
 
 # ------------------------ Scheduler ----------------------
 def _next_run_dt(now_utc: datetime) -> datetime:
@@ -699,6 +758,7 @@ def _next_run_dt(now_utc: datetime) -> datetime:
     if target_local <= now_local:
         target_local += timedelta(days=1)
     return target_local.astimezone(timezone.utc)
+
 
 async def scheduler_loop():
     log.info("[scheduler] started")
@@ -715,6 +775,7 @@ async def scheduler_loop():
             log.exception("[scheduler] loop error")
             await asyncio.sleep(5)
 
+
 # ------------------------ Webhook plumbing ---------------
 @app.on_event("startup")
 async def on_startup():
@@ -728,13 +789,18 @@ async def on_startup():
     url = f"{WEBHOOK_BASE}/webhook/{WEBHOOK_SECRET}"
     await bot.set_webhook(url)
     asyncio.create_task(scheduler_loop())
-    log.info("[startup] webhook set to %s", url)
+    log.info(
+        "[startup] webhook set to %s | report_chat=%s | report_thread=%s",
+        url, REPORT_SUMMARY_CHAT, REPORT_SUMMARY_THREAD_ID
+    )
+
 
 @app.on_event("shutdown")
 async def on_shutdown():
     await bot.delete_webhook()
     await HTTP.close()
     await bot.session.close()
+
 
 @app.post("/webhook/{secret}")
 async def telegram_webhook(secret: str, request: Request):
