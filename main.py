@@ -579,10 +579,9 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
 
     # -------------------- НОВІ ПІДКЛЮЧЕННЯ --------------------
-    # Рахуємо тільки реально створені за день заявки типу "Підключення".
-    # Не використовуємо DATE_MODIFY, щоб не підтягувати старі заявки,
-    # які просто рухались по стадіях/бригадах сьогодні.
-    created_today = await b24_list(
+    # Беремо всі створені за день угоди типу "Підключення",
+    # а потім виключаємо напрямки, які не мають входити в ручний звіт.
+    created_today_raw = await b24_list(
         "crm.deal.list",
         order={"DATE_CREATE": "ASC"},
         filter={
@@ -590,10 +589,16 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
             ">=DATE_CREATE": frm_utc,
             "<DATE_CREATE": to_utc,
         },
-        select=["ID", "TITLE", "CATEGORY_ID", "STAGE_ID", "DATE_CREATE", "TYPE_ID"],
+        select=["ID", "TITLE", "TYPE_ID", "CATEGORY_ID", "STAGE_ID", "DATE_CREATE"],
     )
 
-    # На всякий випадок прибираємо дублікати по ID
+    created_today: List[Dict[str, Any]] = []
+    for d in created_today_raw:
+        cat_id = _cat_id_int(d.get("CATEGORY_ID"))
+        if cat_id in CREATED_EXCLUDED_CATEGORY_IDS:
+            continue
+        created_today.append(d)
+
     created_conn = len({str(d.get("ID")) for d in created_today if d.get("ID") is not None})
 
     # -------------------- ЗАКРИТІ --------------------
@@ -643,12 +648,12 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
         telephony["pages"],
     )
 
-    # Опціонально: тимчасовий дебаг, щоб перевірити які саме заявки потрапили в "Подали"
     for d in created_today:
         log.info(
-            "[created_today] id=%s title=%s cat=%s stage=%s created=%s",
+            "[created_today] id=%s title=%s type=%s cat=%s stage=%s created=%s",
             d.get("ID"),
             d.get("TITLE"),
+            d.get("TYPE_ID"),
             d.get("CATEGORY_ID"),
             d.get("STAGE_ID"),
             d.get("DATE_CREATE"),
