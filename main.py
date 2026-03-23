@@ -578,29 +578,40 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     conn_type_ids = await _connection_type_ids()
     c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
 
-    # НОВІ заявки = створені сьогодні
-     = await b24_list(
+    # -------------------- НОВІ ПІДКЛЮЧЕННЯ --------------------
+    # Рахуємо тільки реально створені за день заявки типу "Підключення".
+    # Не використовуємо DATE_MODIFY, щоб не підтягувати старі заявки,
+    # які просто рухались по стадіях/бригадах сьогодні.
+    created_today = await b24_list(
         "crm.deal.list",
-        order={"ID": "DESC"},
+        order={"DATE_CREATE": "ASC"},
         filter={
             "TYPE_ID": conn_type_ids,
             ">=DATE_CREATE": frm_utc,
             "<DATE_CREATE": to_utc,
         },
+        select=["ID", "TITLE", "CATEGORY_ID", "STAGE_ID", "DATE_CREATE", "TYPE_ID"],
+    )
+
+    # На всякий випадок прибираємо дублікати по ID
+    created_conn = len({str(d.get("ID")) for d in created_today if d.get("ID") is not None})
+
+    # -------------------- ЗАКРИТІ --------------------
+    closed_list = await b24_list(
+        "crm.deal.list",
+        order={"CLOSEDATE": "ASC"},
+        filter={
+            "CATEGORY_ID": 20,
+            "STAGE_ID": "C20:WON",
+            "TYPE_ID": conn_type_ids,
+            ">=CLOSEDATE": frm_utc,
+            "<CLOSEDATE": to_utc,
+        },
         select=["ID"],
     )
-    created_today = await b24_list(
-    "crm.deal.list",
-    order={"DATE_CREATE": "ASC"},
-    filter={
-        "TYPE_ID": conn_type_ids,
-        ">=DATE_CREATE": frm_utc,
-        "<DATE_CREATE": to_utc,
-    },
-    select=["ID", "CATEGORY_ID", "STAGE_ID", "DATE_CREATE", "TYPE_ID", "TITLE"],
-)
-created_conn = len({int(d["ID"]) for d in created_today})
+    closed_conn = len(closed_list)
 
+    # -------------------- АКТИВНІ НА БРИГАДАХ --------------------
     active_open = await b24_list(
         "crm.deal.list",
         order={"ID": "DESC"},
@@ -615,10 +626,33 @@ created_conn = len({int(d["ID"]) for d in created_today})
     )
     active_conn = len(active_open)
 
+    # -------------------- CAT0 СТАДІЇ --------------------
     exact_cnt = await _count_open_in_stage(0, c0_exact_stage, conn_type_ids)
     think_cnt = await _count_open_in_stage(0, c0_think_stage, conn_type_ids)
 
     telephony = await fetch_telephony_for_day(offset_days)
+
+    log.info(
+        "[summary] created=%s closed=%s active=%s exact=%s think=%s tel_total=%s pages=%s",
+        created_conn,
+        closed_conn,
+        active_conn,
+        exact_cnt,
+        think_cnt,
+        telephony["total_records"],
+        telephony["pages"],
+    )
+
+    # Опціонально: тимчасовий дебаг, щоб перевірити які саме заявки потрапили в "Подали"
+    for d in created_today:
+        log.info(
+            "[created_today] id=%s title=%s cat=%s stage=%s created=%s",
+            d.get("ID"),
+            d.get("TITLE"),
+            d.get("CATEGORY_ID"),
+            d.get("STAGE_ID"),
+            d.get("DATE_CREATE"),
+        )
 
     return {
         "date_label": label,
@@ -633,7 +667,6 @@ created_conn = len({int(d["ID"]) for d in created_today})
         },
         "telephony": telephony,
     }
-
 
 # ------------------------ Send helpers -------------------
 async def _safe_send(chat_id: int, text: str, message_thread_id: Optional[int] = None):
