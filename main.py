@@ -579,33 +579,33 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
 
     # -------------------- НОВІ ПІДКЛЮЧЕННЯ --------------------
-created_today_raw = await b24_list(
-    "crm.deal.list",
-    order={"DATE_CREATE": "ASC"},
-    filter={
-        "TYPE_ID": conn_type_ids,
-        ">=DATE_CREATE": frm_utc,
-        "<DATE_CREATE": to_utc,
-    },
-    select=["ID", "TITLE", "TYPE_ID", "CATEGORY_ID", "STAGE_ID", "DATE_CREATE"],
-)
+    created_today_raw = await b24_list(
+        "crm.deal.list",
+        order={"DATE_CREATE": "ASC"},
+        filter={
+            "TYPE_ID": conn_type_ids,
+            ">=DATE_CREATE": frm_utc,
+            "<DATE_CREATE": to_utc,
+        },
+        select=["ID", "TITLE", "TYPE_ID", "CATEGORY_ID", "STAGE_ID", "DATE_CREATE"],
+    )
 
-# виключаємо зайві напрямки (як у ручному звіті)
-EXCLUDED_CATEGORY_IDS = {42, 22}
+    # виключаємо зайві напрямки (як у ручному звіті)
+    EXCLUDED_CATEGORY_IDS = {42, 22}
 
-created_today = []
-for d in created_today_raw:
-    try:
-        cat_id = int(d.get("CATEGORY_ID"))
-    except Exception:
-        cat_id = None
+    created_today = []
+    for d in created_today_raw:
+        try:
+            cat_id = int(d.get("CATEGORY_ID"))
+        except Exception:
+            cat_id = None
 
-    if cat_id in EXCLUDED_CATEGORY_IDS:
-        continue
+        if cat_id in EXCLUDED_CATEGORY_IDS:
+            continue
 
-    created_today.append(d)
+        created_today.append(d)
 
-created_conn = len({str(d.get("ID")) for d in created_today if d.get("ID") is not None})
+    created_conn = len({str(d.get("ID")) for d in created_today if d.get("ID") is not None})
 
     # -------------------- ЗАКРИТІ --------------------
     closed_list = await b24_list(
@@ -654,6 +654,7 @@ created_conn = len({str(d.get("ID")) for d in created_today if d.get("ID") is no
         telephony["pages"],
     )
 
+    # дебаг (можеш потім прибрати)
     for d in created_today:
         log.info(
             "[created_today] id=%s title=%s type=%s cat=%s stage=%s created=%s",
