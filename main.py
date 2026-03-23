@@ -578,32 +578,18 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     conn_type_ids = await _connection_type_ids()
     c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
 
-    created_c0_exact = await b24_list(
+    # НОВІ заявки = створені сьогодні
+    created_today = await b24_list(
         "crm.deal.list",
         order={"ID": "DESC"},
         filter={
-            "CATEGORY_ID": 0,
-            "STAGE_ID": c0_exact_stage,
             "TYPE_ID": conn_type_ids,
             ">=DATE_CREATE": frm_utc,
             "<DATE_CREATE": to_utc,
         },
         select=["ID"],
     )
-
-    created_to_brigades = await b24_list(
-        "crm.deal.list",
-        order={"DATE_MODIFY": "ASC"},
-        filter={
-            "CATEGORY_ID": 20,
-            "STAGE_ID": list(_BRIGADE_STAGE_FULL),
-            "TYPE_ID": conn_type_ids,
-            ">=DATE_MODIFY": frm_utc,
-            "<DATE_MODIFY": to_utc,
-        },
-        select=["ID"],
-    )
-    created_conn = len(created_c0_exact) + len(created_to_brigades)
+    created_conn = len(created_today)
 
     closed_list = await b24_list(
         "crm.deal.list",
@@ -637,17 +623,6 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     think_cnt = await _count_open_in_stage(0, c0_think_stage, conn_type_ids)
 
     telephony = await fetch_telephony_for_day(offset_days)
-
-    log.info(
-        "[summary] created=%s closed=%s active=%s exact=%s think=%s tel_total=%s pages=%s",
-        created_conn,
-        closed_conn,
-        active_conn,
-        exact_cnt,
-        think_cnt,
-        telephony["total_records"],
-        telephony["pages"],
-    )
 
     return {
         "date_label": label,
