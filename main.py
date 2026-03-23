@@ -594,7 +594,10 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
 
     created_today: List[Dict[str, Any]] = []
     for d in created_today_raw:
-        cat_id = _cat_id_int(d.get("CATEGORY_ID"))
+        try:
+    cat_id = int(d.get("CATEGORY_ID"))
+except Exception:
+    cat_id = None
         if cat_id in CREATED_EXCLUDED_CATEGORY_IDS:
             continue
         created_today.append(d)
