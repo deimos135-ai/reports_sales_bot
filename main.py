@@ -579,11 +579,12 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
 
     # -------------------- НОВІ ПІДКЛЮЧЕННЯ --------------------
+    # У ручному звіті використовується TYPE_ID=SALE.
     created_today_raw = await b24_list(
         "crm.deal.list",
         order={"DATE_CREATE": "ASC"},
         filter={
-            "TYPE_ID": conn_type_ids,
+            "TYPE_ID": "SALE",
             ">=DATE_CREATE": frm_utc,
             "<DATE_CREATE": to_utc,
         },
@@ -593,14 +594,20 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     # виключаємо зайві напрямки (як у ручному звіті)
     EXCLUDED_CATEGORY_IDS = {42, 22}
 
-    created_today = []
+    created_today: List[Dict[str, Any]] = []
     for d in created_today_raw:
         try:
             cat_id = int(d.get("CATEGORY_ID"))
         except Exception:
             cat_id = None
 
+        stage_id = str(d.get("STAGE_ID") or "")
+
         if cat_id in EXCLUDED_CATEGORY_IDS:
+            continue
+
+        # якщо треба як у ручному звіті не брати програні
+        if "LOSE" in stage_id:
             continue
 
         created_today.append(d)
@@ -654,7 +661,6 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
         telephony["pages"],
     )
 
-    # дебаг (можеш потім прибрати)
     for d in created_today:
         log.info(
             "[created_today] id=%s title=%s type=%s cat=%s stage=%s created=%s",
