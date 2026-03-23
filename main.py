@@ -51,6 +51,8 @@ DEFAULT_OPERATOR_MAP: Dict[str, str] = {
     "14172": "Ярослава Андрушечко",
     "1156": "Віртуальний Менеджер",
     "44": "Яна Андрущенко",
+    "666": "Аліна Дорогань",
+    "8062": "Світлана Кизь",
     "0": "Без имени",
 }
 OP_NAME: Dict[str, str] = {**DEFAULT_OPERATOR_MAP, **TELEPHONY_OPERATORS}
