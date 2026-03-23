@@ -579,7 +579,7 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
 
     # НОВІ заявки = створені сьогодні
-    created_today = await b24_list(
+     = await b24_list(
         "crm.deal.list",
         order={"ID": "DESC"},
         filter={
@@ -589,21 +589,17 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
         },
         select=["ID"],
     )
-    created_conn = len(created_today)
-
-    closed_list = await b24_list(
-        "crm.deal.list",
-        order={"CLOSEDATE": "ASC"},
-        filter={
-            "CATEGORY_ID": 20,
-            "STAGE_ID": "C20:WON",
-            "TYPE_ID": conn_type_ids,
-            ">=CLOSEDATE": frm_utc,
-            "<CLOSEDATE": to_utc,
-        },
-        select=["ID"],
-    )
-    closed_conn = len(closed_list)
+    created_today = await b24_list(
+    "crm.deal.list",
+    order={"DATE_CREATE": "ASC"},
+    filter={
+        "TYPE_ID": conn_type_ids,
+        ">=DATE_CREATE": frm_utc,
+        "<DATE_CREATE": to_utc,
+    },
+    select=["ID", "CATEGORY_ID", "STAGE_ID", "DATE_CREATE", "TYPE_ID", "TITLE"],
+)
+created_conn = len({int(d["ID"]) for d in created_today})
 
     active_open = await b24_list(
         "crm.deal.list",
