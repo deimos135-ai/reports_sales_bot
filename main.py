@@ -692,8 +692,9 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
         created_by_request_type[req_name] += 1
 
         brought_val = d.get(BROUGHT_BY_FIELD)
-        brought_name = str(brought_val).strip() if brought_val is not None else ""
-        if brought_name:
+        brought_key = str(brought_val).strip() if brought_val is not None else ""
+        brought_name = BROUGHT_BY_MAP.get(brought_key, brought_key or "Не вказано")
+        if brought_name and brought_name != "Не вказано":
             created_by_brought_by[brought_name] += 1
 
     closed_list = await b24_list(
