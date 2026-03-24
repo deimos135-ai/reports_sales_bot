@@ -562,15 +562,26 @@ def format_company_summary(d: Dict[str, Any]) -> str:
     parts.append("━━━━━━━━━━━━━━━")
     parts.append("📌 <b>Підключення</b>")
     parts.append(f"🆕 Подали: <b>{c['created']}</b>")
+
+    if c.get("by_request_type"):
+        for name, cnt in c["by_request_type"].items():
+            parts.append(f"• {html.escape(str(name))}: <b>{cnt}</b>")
+
     parts.append(f"✅ Закрили: <b>{c['closed']}</b>")
     parts.append(f"📊 Активні на бригадах: <b>{c['active']}</b>")
+
+    if c.get("by_brought_by"):
+        parts.append("")
+        parts.append("👤 <b>Хто привів</b>")
+        for name, cnt in c["by_brought_by"].items():
+            parts.append(f"• {html.escape(str(name))}: <b>{cnt}</b>")
+
     parts.append("")
     parts.append(f"📅 На конкретний день: <b>{c0['exact_day']}</b>")
     parts.append(f"💭 Думають: <b>{c0['think']}</b>")
     parts.append("━━━━━━━━━━━━━━━")
     parts.append(format_telephony_summary(t))
     return "\n".join(parts)
-
 
 # ------------------------ Summary builder -----------------
 async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
@@ -581,7 +592,6 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     c0_exact_stage, c0_think_stage = await _resolve_cat0_stage_ids()
 
     # -------------------- НОВІ ПІДКЛЮЧЕННЯ --------------------
-    # У ручному звіті використовується TYPE_ID=SALE.
     created_today_raw = await b24_list(
         "crm.deal.list",
         order={"DATE_CREATE": "ASC"},
@@ -590,10 +600,18 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
             ">=DATE_CREATE": frm_utc,
             "<DATE_CREATE": to_utc,
         },
-        select=["ID", "TITLE", "TYPE_ID", "CATEGORY_ID", "STAGE_ID", "DATE_CREATE"],
+        select=[
+            "ID",
+            "TITLE",
+            "TYPE_ID",
+            "CATEGORY_ID",
+            "STAGE_ID",
+            "DATE_CREATE",
+            TYPE_REQUEST_FIELD,
+            BROUGHT_BY_FIELD,
+        ],
     )
 
-    # виключаємо зайві напрямки (як у ручному звіті)
     EXCLUDED_CATEGORY_IDS = {42, 22}
 
     created_today: List[Dict[str, Any]] = []
@@ -608,7 +626,6 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
         if cat_id in EXCLUDED_CATEGORY_IDS:
             continue
 
-        # якщо треба як у ручному звіті не брати програні
         if "LOSE" in stage_id:
             continue
 
@@ -616,7 +633,31 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
 
     created_conn = len({str(d.get("ID")) for d in created_today if d.get("ID") is not None})
 
-    # -------------------- ЗАКРИТІ --------------------
+    request_type_map = {
+        "358": "Вхідна",
+        "360": "Продзвон",
+        "362": "Офіс Гадяч",
+        "378": "Офіс ЛД",
+        "380": "Прямі продажі",
+        "382": "Приведено працівниками",
+        "1744": "Соц.мережі",
+        "2154": "Онлайн заявка",
+    }
+
+    created_by_request_type: DefaultDict[str, int] = defaultdict(int)
+    created_by_brought_by: DefaultDict[str, int] = defaultdict(int)
+
+    for d in created_today:
+        req_val = d.get(TYPE_REQUEST_FIELD)
+        req_key = str(req_val).strip() if req_val is not None else ""
+        req_name = request_type_map.get(req_key, req_key or "Не вказано")
+        created_by_request_type[req_name] += 1
+
+        brought_val = d.get(BROUGHT_BY_FIELD)
+        brought_name = str(brought_val).strip() if brought_val is not None else ""
+        if brought_name:
+            created_by_brought_by[brought_name] += 1
+
     closed_list = await b24_list(
         "crm.deal.list",
         order={"CLOSEDATE": "ASC"},
@@ -631,7 +672,6 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     )
     closed_conn = len(closed_list)
 
-    # -------------------- АКТИВНІ НА БРИГАДАХ --------------------
     active_open = await b24_list(
         "crm.deal.list",
         order={"ID": "DESC"},
@@ -646,33 +686,10 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     )
     active_conn = len(active_open)
 
-    # -------------------- CAT0 СТАДІЇ --------------------
     exact_cnt = await _count_open_in_stage(0, c0_exact_stage, conn_type_ids)
     think_cnt = await _count_open_in_stage(0, c0_think_stage, conn_type_ids)
 
     telephony = await fetch_telephony_for_day(offset_days)
-
-    log.info(
-        "[summary] created=%s closed=%s active=%s exact=%s think=%s tel_total=%s pages=%s",
-        created_conn,
-        closed_conn,
-        active_conn,
-        exact_cnt,
-        think_cnt,
-        telephony["total_records"],
-        telephony["pages"],
-    )
-
-    for d in created_today:
-        log.info(
-            "[created_today] id=%s title=%s type=%s cat=%s stage=%s created=%s",
-            d.get("ID"),
-            d.get("TITLE"),
-            d.get("TYPE_ID"),
-            d.get("CATEGORY_ID"),
-            d.get("STAGE_ID"),
-            d.get("DATE_CREATE"),
-        )
 
     return {
         "date_label": label,
@@ -680,6 +697,8 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
             "created": created_conn,
             "closed": closed_conn,
             "active": active_conn,
+            "by_request_type": dict(sorted(created_by_request_type.items(), key=lambda x: (-x[1], x[0]))),
+            "by_brought_by": dict(sorted(created_by_brought_by.items(), key=lambda x: (-x[1], x[0]))),
         },
         "cat0": {
             "exact_day": exact_cnt,
