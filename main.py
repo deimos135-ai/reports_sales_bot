@@ -34,6 +34,8 @@ REPORT_TIME = os.environ.get("REPORT_TIME", "19:00")  # HH:MM
 REPORT_SUMMARY_CHAT = int(os.environ.get("REPORT_SUMMARY_CHAT", "0"))  # group/supergroup id
 REPORT_SUMMARY_THREAD_ID = int(os.environ.get("REPORT_SUMMARY_THREAD_ID", "0"))  # topic/thread id
 MIN_OUT_DURATION = int(os.environ.get("MIN_OUT_DURATION", "10"))
+TYPE_REQUEST_FIELD = "UF_CRM_1611757872954"
+BROUGHT_BY_FIELD = "UF_CRM_1611758425920"
 
 # Operators map (ENV has priority)
 _TELEPHONY_OPERATORS_RAW = os.environ.get("TELEPHONY_OPERATORS", "")
