@@ -1,6 +1,8 @@
 # main.py — Fiber Reports + Telephony (Bitrix voximplant.statistic.get)
-# CLEAN VERSION: telephony aligned to Bitrix stat rows + cleaner Telegram output
-# UPDATED: supports Telegram forum topics via message_thread_id
+# SPLIT VERSION:
+# - telephony report -> one Telegram group/topic
+# - connections report -> another Telegram group/topic
+# supports Telegram forum topics via message_thread_id
 
 import asyncio
 import html
@@ -31,8 +33,18 @@ REPORT_TZ_NAME = os.environ.get("REPORT_TZ", "Europe/Kyiv")
 REPORT_TZ = ZoneInfo(REPORT_TZ_NAME)
 REPORT_TIME = os.environ.get("REPORT_TIME", "19:00")  # HH:MM
 
-REPORT_SUMMARY_CHAT = int(os.environ.get("REPORT_SUMMARY_CHAT", "0"))  # group/supergroup id
-REPORT_SUMMARY_THREAD_ID = int(os.environ.get("REPORT_SUMMARY_THREAD_ID", "0"))  # topic/thread id
+# TELEPHONY destination
+REPORT_TELEPHONY_CHAT = int(
+    os.environ.get("REPORT_TELEPHONY_CHAT", os.environ.get("REPORT_SUMMARY_CHAT", "0"))
+)
+REPORT_TELEPHONY_THREAD_ID = int(
+    os.environ.get("REPORT_TELEPHONY_THREAD_ID", os.environ.get("REPORT_SUMMARY_THREAD_ID", "0"))
+)
+
+# CONNECTIONS destination
+REPORT_CONNECTIONS_CHAT = int(os.environ.get("REPORT_CONNECTIONS_CHAT", "0"))
+REPORT_CONNECTIONS_THREAD_ID = int(os.environ.get("REPORT_CONNECTIONS_THREAD_ID", "0"))
+
 MIN_OUT_DURATION = int(os.environ.get("MIN_OUT_DURATION", "10"))
 TYPE_REQUEST_FIELD = "UF_CRM_1611757872954"
 BROUGHT_BY_FIELD = "UF_CRM_1611758425920"
@@ -128,6 +140,7 @@ HTTP: aiohttp.ClientSession
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
 
 # ------------------------ Bitrix helpers ------------------
 async def _sleep_backoff(attempt: int, base: float = 0.5, cap: float = 8.0):
@@ -536,13 +549,11 @@ async def fetch_telephony_for_day(offset_days: int = 0) -> Dict[str, Any]:
         "operator_records": len(op_rows),
         "pages": pages,
         "total_hint": total_hint,
-
         "incoming_total": incoming_total,
         "outgoing_total": outgoing_total,
         "incoming_answered_total": incoming_answered_total,
         "missed_total": missed_total,
         "outgoing_success_10_total": outgoing_success_10_total,
-
         "per_processed": _sorted_items(per_processed),
         "per_in_total": _sorted_items(per_in_total),
         "per_in_answered": _sorted_items(per_in_answered),
@@ -588,11 +599,10 @@ def format_telephony_summary(t: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def format_company_summary(d: Dict[str, Any]) -> str:
+def format_connections_summary(d: Dict[str, Any]) -> str:
     dl = d["date_label"]
     c = d["connections"]
     c0 = d["cat0"]
-    t = d["telephony"]
 
     parts: List[str] = []
     parts.append(f"🗓 <b>Дата: {dl}</b>")
@@ -618,8 +628,20 @@ def format_company_summary(d: Dict[str, Any]) -> str:
     parts.append(f"📅 На конкретний день: <b>{c0['exact_day']}</b>")
     parts.append(f"💭 Думають: <b>{c0['think']}</b>")
     parts.append("━━━━━━━━━━━━━━━")
+    return "\n".join(parts)
+
+
+def format_telephony_report(d: Dict[str, Any]) -> str:
+    dl = d["date_label"]
+    t = d["telephony"]
+
+    parts: List[str] = []
+    parts.append(f"🗓 <b>Дата: {dl}</b>")
+    parts.append("")
+    parts.append("━━━━━━━━━━━━━━━")
     parts.append(format_telephony_summary(t))
     return "\n".join(parts)
+
 
 # ------------------------ Summary builder -----------------
 async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
@@ -746,6 +768,7 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
         "telephony": telephony,
     }
 
+
 # ------------------------ Send helpers -------------------
 async def _safe_send(chat_id: int, text: str, message_thread_id: Optional[int] = None):
     for attempt in range(7):
@@ -775,61 +798,88 @@ async def _safe_send(chat_id: int, text: str, message_thread_id: Optional[int] =
     log.error("telegram send failed permanently (chat %s, thread %s)", chat_id, message_thread_id)
 
 
-async def send_company_summary_to_chat(
-    target_chat: int,
-    offset_days: int = 0,
-    message_thread_id: Optional[int] = None,
-) -> None:
-    try:
-        data = await build_company_summary(offset_days)
-        await _safe_send(
-            target_chat,
-            format_company_summary(data),
-            message_thread_id=message_thread_id,
+async def send_all_reports(offset_days: int = 0) -> None:
+    data = await build_company_summary(offset_days)
+    tasks = []
+
+    if REPORT_TELEPHONY_CHAT:
+        tasks.append(
+            _safe_send(
+                REPORT_TELEPHONY_CHAT,
+                format_telephony_report(data),
+                message_thread_id=REPORT_TELEPHONY_THREAD_ID or None,
+            )
         )
-    except Exception as e:
-        log.exception("company summary failed for chat %s", target_chat)
-        await _safe_send(
-            target_chat,
-            f"❗️Помилка формування сумарного звіту:\n<code>{html.escape(str(e))}</code>",
-            message_thread_id=message_thread_id,
+    else:
+        log.warning("REPORT_TELEPHONY_CHAT is not configured")
+
+    if REPORT_CONNECTIONS_CHAT:
+        tasks.append(
+            _safe_send(
+                REPORT_CONNECTIONS_CHAT,
+                format_connections_summary(data),
+                message_thread_id=REPORT_CONNECTIONS_THREAD_ID or None,
+            )
         )
+    else:
+        log.warning("REPORT_CONNECTIONS_CHAT is not configured")
+
+    if tasks:
+        await asyncio.gather(*tasks)
 
 
 async def send_company_summary(offset_days: int = 0) -> None:
-    if REPORT_SUMMARY_CHAT:
-        await send_company_summary_to_chat(
-            REPORT_SUMMARY_CHAT,
-            offset_days,
-            message_thread_id=REPORT_SUMMARY_THREAD_ID or None,
-        )
-    else:
-        log.warning("REPORT_SUMMARY_CHAT is not configured")
+    await send_all_reports(offset_days)
 
 
 # ------------------------ Manual command -----------------
 @dp.message(Command("report_now"))
 async def report_now(m: Message):
     """
-    /report_now           — сумарний за сьогодні в цей же чат
-    /report_now 1         — сумарний за вчора в цей же чат
+    /report_now           — звіти за сьогодні
+    /report_now 1         — звіти за вчора
     """
     parts = (m.text or "").split()
     offset = 0
     if len(parts) >= 2 and parts[1].lstrip("-").isdigit():
         offset = int(parts[1])
 
-    await m.answer("🔄 Формую сумарний звіт…")
-    await send_company_summary_to_chat(m.chat.id, offset)
+    await m.answer("🔄 Формую звіти…")
 
-    if REPORT_SUMMARY_CHAT and REPORT_SUMMARY_CHAT != m.chat.id:
-        await send_company_summary_to_chat(
-            REPORT_SUMMARY_CHAT,
-            offset,
-            message_thread_id=REPORT_SUMMARY_THREAD_ID or None,
-        )
+    try:
+        data = await build_company_summary(offset)
 
-    await m.answer("✅ Готово")
+        # У поточний чат: обидва повідомлення окремо
+        await _safe_send(m.chat.id, format_connections_summary(data))
+        await _safe_send(m.chat.id, format_telephony_report(data))
+
+        tasks = []
+
+        if REPORT_CONNECTIONS_CHAT and REPORT_CONNECTIONS_CHAT != m.chat.id:
+            tasks.append(
+                _safe_send(
+                    REPORT_CONNECTIONS_CHAT,
+                    format_connections_summary(data),
+                    message_thread_id=REPORT_CONNECTIONS_THREAD_ID or None,
+                )
+            )
+
+        if REPORT_TELEPHONY_CHAT and REPORT_TELEPHONY_CHAT != m.chat.id:
+            tasks.append(
+                _safe_send(
+                    REPORT_TELEPHONY_CHAT,
+                    format_telephony_report(data),
+                    message_thread_id=REPORT_TELEPHONY_THREAD_ID or None,
+                )
+            )
+
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        await m.answer("✅ Готово")
+    except Exception as e:
+        log.exception("manual report failed")
+        await m.answer(f"❗️Помилка:\n<code>{html.escape(str(e))}</code>")
 
 
 # ------------------------ Scheduler ----------------------
@@ -851,8 +901,8 @@ async def scheduler_loop():
             sleep_sec = max(1, (nxt - now_utc).total_seconds())
             log.info("[scheduler] next run at %s in %ss", nxt.isoformat(), int(sleep_sec))
             await asyncio.sleep(sleep_sec)
-            log.info("[scheduler] tick -> sending summary")
-            await send_company_summary(0)
+            log.info("[scheduler] tick -> sending reports")
+            await send_all_reports(0)
         except Exception:
             log.exception("[scheduler] loop error")
             await asyncio.sleep(5)
@@ -865,15 +915,19 @@ async def on_startup():
     HTTP = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
 
     await bot.set_my_commands([
-        BotCommand(command="report_now", description="Сумарний звіт (/report_now [offset])"),
+        BotCommand(command="report_now", description="Звіти (/report_now [offset])"),
     ])
 
     url = f"{WEBHOOK_BASE}/webhook/{WEBHOOK_SECRET}"
     await bot.set_webhook(url)
     asyncio.create_task(scheduler_loop())
     log.info(
-        "[startup] webhook set to %s | report_chat=%s | report_thread=%s",
-        url, REPORT_SUMMARY_CHAT, REPORT_SUMMARY_THREAD_ID
+        "[startup] webhook set to %s | telephony_chat=%s | telephony_thread=%s | connections_chat=%s | connections_thread=%s",
+        url,
+        REPORT_TELEPHONY_CHAT,
+        REPORT_TELEPHONY_THREAD_ID,
+        REPORT_CONNECTIONS_CHAT,
+        REPORT_CONNECTIONS_THREAD_ID,
     )
 
 
