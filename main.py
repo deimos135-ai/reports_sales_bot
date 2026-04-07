@@ -656,7 +656,7 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
         "crm.deal.list",
         order={"DATE_CREATE": "ASC"},
         filter={
-            "TYPE_ID": conn_type_ids,
+            "TYPE_ID": "SALE",
             ">=DATE_CREATE": frm_utc,
             "<DATE_CREATE": to_utc,
         },
