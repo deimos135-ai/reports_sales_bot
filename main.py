@@ -22,6 +22,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import BotCommand, Message, Update
 from zoneinfo import ZoneInfo
+from urllib.parse import urlparse, parse_qs
 
 # ------------------------ Settings ------------------------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -48,6 +49,7 @@ REPORT_CONNECTIONS_THREAD_ID = int(os.environ.get("REPORT_CONNECTIONS_THREAD_ID"
 MIN_OUT_DURATION = int(os.environ.get("MIN_OUT_DURATION", "10"))
 TYPE_REQUEST_FIELD = "UF_CRM_1611757872954"
 BROUGHT_BY_FIELD = "UF_CRM_1611758425920"
+CONNECTIONS_REPORT_URL = os.environ.get("CONNECTIONS_REPORT_URL", "").strip()
 
 BROUGHT_BY_MAP = {
     "366": "Михайленко Олена",
@@ -642,10 +644,85 @@ def format_telephony_report(d: Dict[str, Any]) -> str:
     parts.append(format_telephony_summary(t))
     return "\n".join(parts)
 
+def _parse_bitrix_report_filter(url: str) -> Dict[str, Any]:
+    """
+    Парсить конкретний Bitrix report URL формату /crm/reports/report/view/...
+    Для вашого кейсу витягаємо:
+    - дату зі звіту
+    - виключені CATEGORY_ID
+    """
+    if not url:
+        return {
+            "report_date_label": None,
+            "excluded_category_ids": set(),
+        }
+
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+
+        date_label = None
+        excluded_category_ids: set[int] = set()
+
+        # У вашому URL дата сидить тут:
+        # filter[0][4]=07.04.2026
+        raw_date = (qs.get("filter[0][4]") or [None])[0]
+        if raw_date:
+            date_label = raw_date.strip()
+
+        # У вашому URL виключені категорії сидять тут:
+        # filter[0][5]=42
+        # filter[0][6]=22
+        for key in ("filter[0][5]", "filter[0][6]"):
+            raw_val = (qs.get(key) or [None])[0]
+            if raw_val:
+                try:
+                    excluded_category_ids.add(int(raw_val))
+                except Exception:
+                    pass
+
+        return {
+            "report_date_label": date_label,
+            "excluded_category_ids": excluded_category_ids,
+        }
+
+    except Exception as e:
+        log.warning("Failed to parse CONNECTIONS_REPORT_URL: %s", e)
+        return {
+            "report_date_label": None,
+            "excluded_category_ids": set(),
+        }
+
+
+def _day_bounds_from_label(date_label: str) -> Tuple[str, str, str, str, str]:
+    """
+    date_label format: DD.MM.YYYY
+    """
+    dt_local = datetime.strptime(date_label, "%d.%m.%Y").replace(tzinfo=REPORT_TZ)
+    start_local = dt_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = start_local + timedelta(days=1)
+
+    def _fmt_local(dt: datetime) -> str:
+        return dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+    start_utc = start_local.astimezone(timezone.utc).isoformat()
+    end_utc = end_local.astimezone(timezone.utc).isoformat()
+    label = start_local.strftime("%d.%m.%Y")
+    return label, start_utc, end_utc, _fmt_local(start_local), _fmt_local(end_local)
+
 
 # ------------------------ Summary builder -----------------
 async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
-    label, frm_utc, to_utc, _, _ = _day_bounds(offset_days)
+    report_filter = _parse_bitrix_report_filter(CONNECTIONS_REPORT_URL)
+
+    if report_filter["report_date_label"]:
+        label, frm_utc, to_utc, _, _ = _day_bounds_from_label(report_filter["report_date_label"])
+        log.info("[connections] using date from CONNECTIONS_REPORT_URL: %s", report_filter["report_date_label"])
+    else:
+        label, frm_utc, to_utc, _, _ = _day_bounds(offset_days)
+        log.info("[connections] using offset_days date: %s", label)
+
+    excluded_category_ids = report_filter["excluded_category_ids"]
 
     _ = await get_deal_type_map()
     conn_type_ids = await _connection_type_ids()
@@ -656,7 +733,7 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
         "crm.deal.list",
         order={"DATE_CREATE": "ASC"},
         filter={
-            "TYPE_ID": "SALE",
+            "TYPE_ID": conn_type_ids,   # тільки підключення
             ">=DATE_CREATE": frm_utc,
             "<DATE_CREATE": to_utc,
         },
@@ -672,9 +749,8 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
         ],
     )
 
-    ALLOWED_CATEGORY_IDS = {0, 20}
-
     created_today: List[Dict[str, Any]] = []
+
     for d in created_today_raw:
         try:
             cat_id = int(d.get("CATEGORY_ID"))
@@ -683,13 +759,36 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
 
         stage_id = str(d.get("STAGE_ID") or "")
 
-        if cat_id in EXCLUDED_CATEGORY_IDS:
+        # у вас нові підключення тільки в 0 або 22
+        if cat_id not in {0, 22}:
             continue
 
+        # якщо в URL є виключення — застосовуємо їх
+        if cat_id in excluded_category_ids:
+            continue
+
+        # відкидаємо програні
         if "LOSE" in stage_id:
             continue
 
         created_today.append(d)
+
+    log.info(
+        "[connections-created] raw=%s filtered=%s excluded_categories=%s",
+        len(created_today_raw),
+        len(created_today),
+        sorted(excluded_category_ids),
+    )
+
+    for d in created_today:
+        log.info(
+            "[connections-created-row] id=%s cat=%s stage=%s type=%s title=%s",
+            d.get("ID"),
+            d.get("CATEGORY_ID"),
+            d.get("STAGE_ID"),
+            d.get("TYPE_ID"),
+            d.get("TITLE"),
+        )
 
     created_conn = len({str(d.get("ID")) for d in created_today if d.get("ID") is not None})
 
