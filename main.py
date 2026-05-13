@@ -50,9 +50,6 @@ MIN_OUT_DURATION = int(os.environ.get("MIN_OUT_DURATION", "10"))
 TYPE_REQUEST_FIELD = "UF_CRM_1611757872954"
 BROUGHT_BY_FIELD = "UF_CRM_1611758425920"
 CONNECTIONS_REPORT_URL = os.environ.get("CONNECTIONS_REPORT_URL", "").strip()
-# За замовчуванням НЕ беремо дату з URL звіту, бо URL часто лишається зі старою/ручною датою.
-# Якщо дуже треба стару поведінку — поставте CONNECTIONS_USE_REPORT_URL_DATE=1.
-CONNECTIONS_USE_REPORT_URL_DATE = os.environ.get("CONNECTIONS_USE_REPORT_URL_DATE", "0").strip().lower() in ("1", "true", "yes", "y")
 
 BROUGHT_BY_MAP = {
     "366": "Михайленко Олена",
@@ -649,66 +646,53 @@ def format_telephony_report(d: Dict[str, Any]) -> str:
 
 def _parse_bitrix_report_filter(url: str) -> Dict[str, Any]:
     """
-    Парсить Bitrix report URL формату /crm/reports/report/view/...
-
-    Важливо:
-    - URL звіту використовує внутрішні filter[...][...] ключі, які можуть змінюватись.
-    - Тому дату з URL ми тільки витягаємо для логів/сумісності, але за замовчуванням НЕ використовуємо.
-    - Категорії для виключення беремо з env CONNECTIONS_EXCLUDED_CATEGORY_IDS, якщо задано.
-      Приклад: CONNECTIONS_EXCLUDED_CATEGORY_IDS='[22,42]' або '22,42'
-    - Старий fallback лишено для URL, де виключені CATEGORY_ID були саме в filter[0][5] і filter[0][6].
+    Парсить конкретний Bitrix report URL формату /crm/reports/report/view/...
+    Для вашого кейсу витягаємо:
+    - дату зі звіту
+    - виключені CATEGORY_ID
     """
-    out = {
-        "report_date_label": None,
-        "excluded_category_ids": set(),
-    }
-
-    # Надійний спосіб задати виключені напрямки/категорії.
-    raw_env = os.environ.get("CONNECTIONS_EXCLUDED_CATEGORY_IDS", "").strip()
-    if raw_env:
-        try:
-            vals = json.loads(raw_env)
-            if not isinstance(vals, list):
-                vals = [vals]
-        except Exception:
-            vals = [x.strip() for x in raw_env.split(",") if x.strip()]
-
-        for v in vals:
-            try:
-                out["excluded_category_ids"].add(int(v))
-            except Exception:
-                log.warning("Bad CONNECTIONS_EXCLUDED_CATEGORY_IDS value: %r", v)
-
     if not url:
-        return out
+        return {
+            "report_date_label": None,
+            "excluded_category_ids": set(),
+        }
 
     try:
         parsed = urlparse(url)
         qs = parse_qs(parsed.query)
 
-        # У старому URL дата була тут: filter[0][4]=07.04.2026
+        date_label = None
+        excluded_category_ids: set[int] = set()
+
+        # У вашому URL дата сидить тут:
+        # filter[0][4]=07.04.2026
         raw_date = (qs.get("filter[0][4]") or [None])[0]
         if raw_date:
-            raw_date = raw_date.strip()
-            if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", raw_date):
-                out["report_date_label"] = raw_date
+            date_label = raw_date.strip()
 
-        # Старий fallback: у вашому попередньому URL виключені категорії були тут.
-        # Якщо env CONNECTIONS_EXCLUDED_CATEGORY_IDS заданий, він має пріоритет.
-        if not out["excluded_category_ids"]:
-            for key in ("filter[0][5]", "filter[0][6]"):
-                raw_val = (qs.get(key) or [None])[0]
-                if raw_val:
-                    try:
-                        out["excluded_category_ids"].add(int(raw_val))
-                    except Exception:
-                        pass
+        # У вашому URL виключені категорії сидять тут:
+        # filter[0][5]=42
+        # filter[0][6]=22
+        for key in ("filter[0][5]", "filter[0][6]"):
+            raw_val = (qs.get(key) or [None])[0]
+            if raw_val:
+                try:
+                    excluded_category_ids.add(int(raw_val))
+                except Exception:
+                    pass
 
-        return out
+        return {
+            "report_date_label": date_label,
+            "excluded_category_ids": excluded_category_ids,
+        }
 
     except Exception as e:
         log.warning("Failed to parse CONNECTIONS_REPORT_URL: %s", e)
-        return out
+        return {
+            "report_date_label": None,
+            "excluded_category_ids": set(),
+        }
+
 
 def _day_bounds_from_label(date_label: str) -> Tuple[str, str, str, str, str]:
     """
@@ -731,19 +715,12 @@ def _day_bounds_from_label(date_label: str) -> Tuple[str, str, str, str, str]:
 async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     report_filter = _parse_bitrix_report_filter(CONNECTIONS_REPORT_URL)
 
-    if CONNECTIONS_USE_REPORT_URL_DATE and report_filter["report_date_label"]:
+    if report_filter["report_date_label"]:
         label, frm_utc, to_utc, _, _ = _day_bounds_from_label(report_filter["report_date_label"])
         log.info("[connections] using date from CONNECTIONS_REPORT_URL: %s", report_filter["report_date_label"])
     else:
         label, frm_utc, to_utc, _, _ = _day_bounds(offset_days)
-        if report_filter["report_date_label"]:
-            log.info(
-                "[connections] ignoring CONNECTIONS_REPORT_URL date %s; using offset_days date: %s",
-                report_filter["report_date_label"],
-                label,
-            )
-        else:
-            log.info("[connections] using offset_days date: %s", label)
+        log.info("[connections] using offset_days date: %s", label)
 
     excluded_category_ids = report_filter["excluded_category_ids"]
 
@@ -782,10 +759,11 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
 
         stage_id = str(d.get("STAGE_ID") or "")
 
-        # Рахуємо так само широко, як Bitrix-звіт: НЕ обмежуємо тільки категоріями 0/22.
-        # Раніше тут було `if cat_id not in {0, 22}: continue`, через це бот
-        # пропускав частину заявок, наприклад ті, що вже потрапили в інший напрямок/воронку.
-        # Якщо треба щось виключити — задайте CONNECTIONS_EXCLUDED_CATEGORY_IDS або URL-фільтр.
+        # у вас нові підключення тільки в 0 або 22
+        if cat_id not in {0, 22}:
+            continue
+
+        # якщо в URL є виключення — застосовуємо їх
         if cat_id in excluded_category_ids:
             continue
 
