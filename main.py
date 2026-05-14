@@ -766,8 +766,9 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
 
         stage_id = str(d.get("STAGE_ID") or "")
 
-        # у вас нові підключення тільки в 0 або 22
-        if cat_id not in {0, 22}:
+        # нові підключення можуть бути в 0/22, а якщо заявку в той же день закрили,
+        # Bitrix вже може показувати її в категорії 20 як "Успішна угода"
+        if cat_id not in {0, 22, 20}:
             continue
 
         # ВАЖЛИВО:
