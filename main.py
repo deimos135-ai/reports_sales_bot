@@ -715,12 +715,19 @@ def _day_bounds_from_label(date_label: str) -> Tuple[str, str, str, str, str]:
 async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
     report_filter = _parse_bitrix_report_filter(CONNECTIONS_REPORT_URL)
 
+    # ВАЖЛИВО:
+    # Раніше дата могла братися з CONNECTIONS_REPORT_URL, наприклад 07.04.2026,
+    # тому після редеплою бот постійно слав звіт за одну й ту саму дату.
+    # Тепер дата звіту завжди рахується від поточного дня + offset_days.
+    # CONNECTIONS_REPORT_URL залишаємо тільки як джерело виключених категорій.
+    label, frm_utc, to_utc, _, _ = _day_bounds(offset_days)
+    log.info("[connections] using offset_days date: %s", label)
+
     if report_filter["report_date_label"]:
-        label, frm_utc, to_utc, _, _ = _day_bounds_from_label(report_filter["report_date_label"])
-        log.info("[connections] using date from CONNECTIONS_REPORT_URL: %s", report_filter["report_date_label"])
-    else:
-        label, frm_utc, to_utc, _, _ = _day_bounds(offset_days)
-        log.info("[connections] using offset_days date: %s", label)
+        log.info(
+            "[connections] ignoring static date from CONNECTIONS_REPORT_URL: %s",
+            report_filter["report_date_label"],
+        )
 
     excluded_category_ids = report_filter["excluded_category_ids"]
 
