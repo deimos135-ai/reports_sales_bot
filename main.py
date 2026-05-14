@@ -770,9 +770,9 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
         if cat_id not in {0, 22}:
             continue
 
-        # якщо в URL є виключення — застосовуємо їх
-        if cat_id in excluded_category_ids:
-            continue
+        # ВАЖЛИВО:
+        # Не застосовуємо excluded_category_ids з CONNECTIONS_REPORT_URL до нових заявок.
+        # У Bitrix URL може бути виключена категорія 22, через що "Подали" рахувалось як 0.
 
         # відкидаємо програні
         if "LOSE" in stage_id:
@@ -781,7 +781,7 @@ async def build_company_summary(offset_days: int = 0) -> Dict[str, Any]:
         created_today.append(d)
 
     log.info(
-        "[connections-created] raw=%s filtered=%s excluded_categories=%s",
+        "[connections-created] raw=%s filtered=%s ignored_excluded_categories=%s",
         len(created_today_raw),
         len(created_today),
         sorted(excluded_category_ids),
@@ -988,6 +988,49 @@ async def report_now(m: Message):
         await m.answer(f"❗️Помилка:\n<code>{html.escape(str(e))}</code>")
 
 
+@dp.message(Command("report_yest"))
+async def report_yest(m: Message):
+    """
+    /report_yest          — звіти за попередній день
+    """
+    await m.answer("🔄 Формую звіти за вчора…")
+
+    try:
+        data = await build_company_summary(1)
+
+        # У поточний чат: обидва повідомлення окремо
+        await _safe_send(m.chat.id, format_connections_summary(data))
+        await _safe_send(m.chat.id, format_telephony_report(data))
+
+        tasks = []
+
+        if REPORT_CONNECTIONS_CHAT and REPORT_CONNECTIONS_CHAT != m.chat.id:
+            tasks.append(
+                _safe_send(
+                    REPORT_CONNECTIONS_CHAT,
+                    format_connections_summary(data),
+                    message_thread_id=REPORT_CONNECTIONS_THREAD_ID or None,
+                )
+            )
+
+        if REPORT_TELEPHONY_CHAT and REPORT_TELEPHONY_CHAT != m.chat.id:
+            tasks.append(
+                _safe_send(
+                    REPORT_TELEPHONY_CHAT,
+                    format_telephony_report(data),
+                    message_thread_id=REPORT_TELEPHONY_THREAD_ID or None,
+                )
+            )
+
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        await m.answer("✅ Готово")
+    except Exception as e:
+        log.exception("manual yesterday report failed")
+        await m.answer(f"❗️Помилка:\n<code>{html.escape(str(e))}</code>")
+
+
 # ------------------------ Scheduler ----------------------
 def _next_run_dt(now_utc: datetime) -> datetime:
     hh, mm = map(int, REPORT_TIME.split(":", 1))
@@ -1022,6 +1065,7 @@ async def on_startup():
 
     await bot.set_my_commands([
         BotCommand(command="report_now", description="Звіти (/report_now [offset])"),
+        BotCommand(command="report_yest", description="Звіти за попередній день"),
     ])
 
     url = f"{WEBHOOK_BASE}/webhook/{WEBHOOK_SECRET}"
